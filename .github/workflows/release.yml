@@ -108,6 +108,9 @@ jobs:
           OUTNAME: Monogram-Desktop-${{ env.VERSION }}-x86_64.AppImage
           OUTPATH: ${{ github.workspace }}/dist
           DEPLOY_OPENGL: "1"
+          # Ship no GPU drivers (no ~100 MiB LLVM-linked Mesa): use the host's at runtime. Fits this app:
+          # GTK, OpenGL 3.3 only, no Vulkan dependency, and GTK falls back to its cairo renderer.
+          USE_HOST_DRIVERS: "1"
           DEPLOY_GTK: "1"
           DEPLOY_GLYCIN: "1"
           DEPLOY_GSTREAMER: "1"
