@@ -99,7 +99,9 @@ impl Handle {
             let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().expect("crypto runtime");
             runtime.block_on(async move{tokio::select!{_=stopped=>{},_=async move {
                 let mut worker=Worker{root:lifecycle::root(),owner,generation,network,events,local:None,online:false,ready:false,reviews:BTreeMap::new()};
-                loop {tokio::select! {biased;request=rx.recv()=>{let Some(request)=request else{break};worker.process(request).await;},frame=incoming.recv()=>{let Some(frame)=frame else{break};worker.process(Request::Incoming(frame)).await;},request=preview_frames.recv()=>{let Some(request)=request else{break};worker.process(request).await;}}}
+                let mut recovery = super::keyring_recovery_timer();
+                loop {tokio::select! {biased;
+                    _ = recovery.tick(), if worker.online && worker.local.is_none() => { if crate::crypto::vault::unlocked().await { worker.process(Request::Enable).await; } },request=rx.recv()=>{let Some(request)=request else{break};worker.process(request).await;},frame=incoming.recv()=>{let Some(frame)=frame else{break};worker.process(Request::Incoming(frame)).await;},request=preview_frames.recv()=>{let Some(request)=request else{break};worker.process(request).await;}}}
             }=>{}}});
         }).expect("crypto thread");
         Self {
@@ -164,6 +166,8 @@ fn unavailable(owner: &str, frame: &Frame, text: &str) -> Option<BackendEvent> {
             .map(|(id, stamp)| (id.as_str(), stamp.as_str())),
     )?;
     message.text = text.into();
+    message.set_encryption(crate::encryption_policy::Mode::Omemo2, String::new());
+    message.unavailable = true;
     if let Some(header) = frame
         .xml
         .get_child("encrypted", NS)
@@ -226,7 +230,7 @@ impl From<pep::Error> for PreparationError {
 impl PreparationError {
     fn fallback(&self) -> bool {
         match self {
-            Self::NoDevices | Self::Crypto(Error::TrustRequired | Error::InvalidBundle) => true,
+            Self::NoDevices | Self::Crypto(Error::TrustRequired | Error::InvalidBundle(_)) => true,
             Self::Pep(error) => error.access_denied() || error.unsupported(),
             Self::Crypto(_) => false,
         }
@@ -305,13 +309,17 @@ impl Worker {
         self.status(Some("Preparing OMEMO 2…".into()));
         if self.local.is_none() {
             self.local = Some(Local::open(&self.root, &self.owner, true).await?);
+            eprintln!("Monogram encryption: Classic OMEMO2 local keys loaded");
         }
         let local = self.local.as_mut().unwrap();
         let bundle = device::prepare(
             &mut local.engine.store,
             chrono::Utc::now().timestamp_millis() as u64,
         )?;
-        self.pep()?.initialize(&bundle).await?;
+        if let Err(error) = self.pep()?.initialize(&bundle).await {
+            self.retry().await;
+            return Err(error.into());
+        }
         self.recover().await?;
         self.ready = true;
         self.status(None);
@@ -339,7 +347,11 @@ impl Worker {
             .await
             .map_err(|error| match error {
                 pep::Error::Crypto(Error::Invalid(_) | Error::Crypto(_)) => {
-                    PreparationError::Crypto(Error::InvalidBundle)
+                    PreparationError::Crypto(Error::invalid_bundle(
+                        crate::encryption_policy::Mode::Omemo2.name(),
+                        peer,
+                        Some(id),
+                    ))
                 }
                 _ => error.into(),
             })?;
@@ -397,7 +409,7 @@ impl Worker {
                         }
                     }
                 }
-                Err(PreparationError::Crypto(Error::InvalidBundle))
+                Err(PreparationError::Crypto(Error::InvalidBundle(_)))
                     if optional && peer == self.owner => {}
                 Err(error) => return Err(error),
             }
@@ -610,10 +622,10 @@ impl Worker {
         self.incoming_mode(frame, false).await
     }
     async fn incoming_mode(&mut self, frame: Frame, preview: bool) -> Result<()> {
-        if !self.ready && !preview {
+        if self.local.is_none() && !preview {
             self.placeholder(
                 &frame,
-                "Encrypted message — enable OMEMO 2 and review the sender's devices",
+                "Encrypted message — local encryption keys are not ready yet. Retrying automatically.",
             );
             return Ok(());
         }
@@ -865,9 +877,9 @@ impl Worker {
             let Some(history) = self.history()? else {
                 return Ok(vec![]);
             };
-            let mut query=history.db.prepare("SELECT body FROM messages WHERE account=? AND json_extract(body,'$.unavailable')=1 AND length(json_extract(body,'$.ciphertext'))>0 LIMIT 128")?;
+            let mut query=history.db.prepare("SELECT body FROM (SELECT body,timestamp FROM messages WHERE account=? AND json_extract(body,'$.unavailable')=1 AND COALESCE(json_extract(body,'$.encryption_mode'),'Omemo2') NOT IN ('Pq','Legacy') AND instr(json_extract(body,'$.ciphertext'),?2)>0 ORDER BY timestamp DESC LIMIT 128) ORDER BY timestamp ASC")?;
             let rows = query
-                .query_map([&self.owner], |r| r.get::<_, String>(0))?
+                .query_map([self.owner.as_str(), NS], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows
                 .into_iter()
@@ -875,8 +887,11 @@ impl Worker {
                 .collect())
         })();
         if let Ok(rows) = rows {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
             for message in rows {
+                if tokio::time::Instant::now() >= deadline { break; }
                 if let Ok(mut xml) = bundle::document(&message.ciphertext, 1024 * 1024) {
+                    if xml.get_child("encrypted", NS).is_none() { continue; }
                     if xml.get_child("delay", "urn:xmpp:delay").is_none() {
                         xml.append_child(
                             Element::builder("delay", "urn:xmpp:delay")
@@ -890,7 +905,7 @@ impl Worker {
                         historical: true,
                         receipt_to: None,
                     };
-                    if let Err(error) = Box::pin(self.incoming(frame.clone())).await {
+                    if let Ok(Err(error)) = tokio::time::timeout_at(deadline, Box::pin(self.incoming(frame.clone()))).await {
                         self.placeholder(&frame, &error.to_string());
                     }
                 }
@@ -949,7 +964,8 @@ impl Worker {
                 match self.send_message(&peer, &message, &quote).await {
                     Ok(()) => self.emit(BackendEvent::Sent { peer, id }),
                     Err(error) => {
-                        self.emit(if matches!(error, Error::Uncertain) {
+                        let uncertain = matches!(error, Error::Uncertain);
+                        self.emit(if uncertain {
                             BackendEvent::Uncertain {
                                 peer: peer.clone(),
                                 id,
@@ -958,12 +974,16 @@ impl Worker {
                             BackendEvent::Failed {
                                 peer: peer.clone(),
                                 id,
+                                reason: format!("{} [{}]", error, error.diagnostic()),
                             }
                         });
-                        self.emit(BackendEvent::CryptoError {
-                            peer,
-                            text: error.to_string(),
-                        });
+                        // A failed send already carries its reason in the toast.
+                        if uncertain {
+                            self.emit(BackendEvent::CryptoError {
+                                peer,
+                                text: error.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -1417,7 +1437,7 @@ mod tests {
             history.set_blind_trust(owner, peer, false).unwrap();
             assert!(matches!(probe(&alice, peer).await, Err(Error::OwnDeviceTrustRequired)));
             let (reply, selected) = oneshot::channel();
-            assert!(alice.send(Command::ChooseEncryption { peer: peer.into(), reply }));
+            assert!(alice.send(Command::ChooseEncryption { peer: peer.into(), reply, skip_unreachable: false }));
             assert!(matches!(tokio::time::timeout(Duration::from_secs(15), selected).await.unwrap().unwrap(), Err(Error::OwnDeviceTrustRequired)));
             history.set_blind_trust(owner, peer, true).unwrap();
             assert!(probe(&alice, peer).await.unwrap(), "Conversation blind trust approves authenticated own-device copies");
@@ -1472,5 +1492,101 @@ mod tests {
         );
         drop(alice);
         drop(bob);
+    }
+}
+
+#[cfg(test)]
+mod keyring_recovery_tests {
+    use super::*;
+    #[test]
+    fn replay_never_reclassifies_other_encryption_protocols() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let owner="receiver@fixture.invalid";
+            let root=std::env::temp_dir().join(format!("monogram-replay-{}",crate::model::new_id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let db=rusqlite::Connection::open(root.join("history.sqlite3")).unwrap();
+            db.execute_batch("CREATE TABLE messages(account TEXT,body TEXT,timestamp TEXT)").unwrap();
+            let mut cases=vec![("pq",crate::encryption_policy::Mode::Pq);129];
+            cases.extend([("legacy",crate::encryption_policy::Mode::Legacy),("classic",crate::encryption_policy::Mode::Omemo2)]);
+            for (id,mode) in cases {
+                let xml=format!("<message xmlns='jabber:client' from='sender@fixture.invalid' to='{owner}' id='{id}'><encrypted xmlns='{NS}'><header sid='202'/><payload>AA==</payload></encrypted></message>");
+                let frame=Frame{xml:bundle::document(&xml,4096).unwrap(),archive:None,historical:true,receipt_to:None};
+                assert!(unavailable(owner,&frame,"fixture").is_some());
+                let mut message=Message{unavailable:true,ciphertext:xml,..Default::default()};
+                message.set_encryption(mode,String::new());
+                if id=="classic" {message.encrypted=false;message.encryption_mode=None;}
+                db.execute("INSERT INTO messages VALUES(?1,?2,'2026-11-25T00:00:00Z')",rusqlite::params![owner,serde_json::to_string(&message).unwrap()]).unwrap();
+            }
+            drop(db);
+            let (network,_)=channel::unbounded_channel();let (events,received)=mpsc::channel();
+            let mut worker=Worker{root:root.clone(),owner:owner.into(),generation:1,network,events,local:None,online:false,ready:false,reviews:BTreeMap::new()};
+            worker.retry().await;
+            let events=received.try_iter().collect::<Vec<_>>();assert_eq!(events.len(),1);
+            assert!(matches!(&events[0].2,BackendEvent::Message{message,..} if message.wire_id=="classic" && message.encrypted && message.unavailable && message.mode()==crate::encryption_policy::Mode::Omemo2));
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+    #[test]
+    #[ignore = "requires a private Secret Service fixture"]
+    fn local_keyring_startup_failure_recovers_without_device_review() {
+        assert_eq!(std::env::var("MONOGRAM_KEYRING_FIXTURE").as_deref(), Ok("1"));
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let owner = "keyring-recovery@fixture.invalid";
+            let root = lifecycle::root();
+            let local = Local::open(&root, owner, true).await.unwrap();
+            drop(local);
+            let profile = root.join("crypto").join(lifecycle::hex(&openssl::sha::sha256(owner.as_bytes()))).join("device.json");
+            let before:serde_json::Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+            assert!(!before["identity"].is_null());
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let run = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            assert_eq!(home.parent(),run.parent(),"fixture must own its private HOME and bus roots");
+            assert!(home.ends_with("home"));
+            let pid = std::env::var("MONOGRAM_FIXTURE_KEYRING_PID").unwrap();
+            let owner_pid = std::process::Command::new("gdbus").args(["call","--session","--dest","org.freedesktop.DBus","--object-path","/org/freedesktop/DBus","--method","org.freedesktop.DBus.GetConnectionUnixProcessID","org.freedesktop.secrets"]).output().unwrap();
+            assert_eq!(String::from_utf8(owner_pid.stdout).unwrap().trim(),format!("(uint32 {pid},)"));
+            assert!(std::process::Command::new("kill").args(["-TERM",&pid]).status().unwrap().success());
+            for _ in 0..100 {
+                if !std::path::Path::new(&format!("/proc/{pid}")).exists(){break;}
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let (network, mut wire) = channel::unbounded_channel();
+            let (events, received) = mpsc::channel();
+            let handle = Handle::start(owner.into(), 1, network, events);
+            handle.send(Request::Online(true));
+            let deadline = std::time::Instant::now()+std::time::Duration::from_secs(10);
+            let mut failed = false;
+            let mut statuses = Vec::new();
+            while std::time::Instant::now()<deadline {
+                if let Ok((_,_,BackendEvent::CryptoStatus(s))) = received.try_recv() {
+                    statuses.push(s.text.clone());
+                    if s.text == Error::Vault.to_string() {failed=true;break;}
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(failed,"fixture must reproduce unavailable local key storage: {statuses:?}");
+            struct Stop(std::process::Child);
+            impl Drop for Stop {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+            let control = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join("keyring-restarted");
+            std::fs::create_dir_all(&control).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&control,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut daemon = Stop(std::process::Command::new("gnome-keyring-daemon")
+                .args(["--foreground","--unlock","--components=secrets","--control-directory"]).arg(control)
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+            use std::io::Write;
+            daemon.0.stdin.take().unwrap().write_all(b"fictional fixture password").unwrap();
+            // Publication proves the existing worker resumed initialization without Enable/reconnect.
+            let recovered = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+                loop { if matches!(wire.recv().await.unwrap(), Command::Iq { .. }) { break; } }
+            }).await;
+            if recovered.is_err() {
+                while let Ok((_,_,BackendEvent::CryptoStatus(s)))=received.try_recv(){statuses.push(s.text);}
+                panic!("recovery timed out: {statuses:?}; daemon={:?}",daemon.0.try_wait());
+            }
+            let after:serde_json::Value = serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+            assert_eq!(before, after, "recovery must preserve the pinned device and identity");
+            drop(handle);
+        });
     }
 }

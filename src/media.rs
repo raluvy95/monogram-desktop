@@ -23,22 +23,15 @@ impl Ui {
         });
     }
     pub fn make_media(self: &Rc<Self>) {
-        self.media_pane.add_css_class("utility-sidebar");
-        let header = adw::HeaderBar::builder()
-            .show_start_title_buttons(false)
-            .build();
-        let close = icon_button("sidebar-show-symbolic", "Close media pane");
+        let chrome = crate::components::UtilityPane::adopt(&self.media_pane);
+        let header = chrome.header.clone();
         let utility = self.utility.downgrade();
-        close.connect_clicked(move |_| {
+        chrome.close("Close media pane", false, move || {
             if let Some(u) = utility.upgrade() {
                 u.set_show_sidebar(false)
             }
         });
-        header.pack_start(&close);
-        let toggle = adw::ToggleGroup::builder()
-            .homogeneous(false)
-            .can_shrink(false)
-            .build();
+        let toggle = self.media_tabs.clone();
         toggle.add_css_class("media-mode-tabs");
         toggle.add_css_class("round");
         for (name, title) in [
@@ -53,11 +46,12 @@ impl Ui {
         let stack = self.media_stack.downgrade();
         toggle.connect_active_name_notify(move |t| {
             if let (Some(stack), Some(name)) = (stack.upgrade(), t.active_name()) {
+                if stack.child_by_name(&name).is_none() { return; }
                 let previous = stack.visible_child_name();
                 if previous.as_deref() == Some(name.as_str()) {
                     return;
                 }
-                let tabs = ["emoji", "stickers", "gifs"];
+                let tabs = ["emoji", "stickers", "gifs", "monero"];
                 let index = |name: &str| tabs.iter().position(|tab| *tab == name).unwrap_or(0);
                 stack.set_visible_child_full(
                     &name,
@@ -70,7 +64,6 @@ impl Ui {
             }
         });
         header.set_title_widget(Some(&toggle));
-        self.media_pane.add_top_bar(&header);
         let body = bx(true, 0);
         body.set_margin_top(12);
         let search = self.media_search.clone();
@@ -94,12 +87,14 @@ impl Ui {
         );
         self.rebuild_pack_library();
         self.rebuild_gif_library();
+        self.refresh_monero_sidebar();
         let t = toggle.downgrade();
+        let tabs_ui=Rc::downgrade(self);
         let search_weak = search.downgrade();
         self.media_stack
             .connect_visible_child_name_notify(move |s| {
                 if let Some(name) = s.visible_child_name() {
-                    if let Some(t) = t.upgrade() {
+                    if let Some(t) = t.upgrade().filter(|_|tabs_ui.upgrade().is_some_and(|ui|ui.media_toggles.borrow().contains_key(name.as_str()))) {
                         t.set_active_name(Some(&name))
                     }
                     if let Some(search) = search_weak.upgrade() {
@@ -119,6 +114,36 @@ impl Ui {
             }
         });
     }
+    pub(crate) fn refresh_monero_sidebar(self: &Rc<Self>) {
+        let owner=self.state.borrow().account.clone();
+        let settings:crate::monero_settings::Settings=serde_json::from_str(&self.store.pref(&format!("monero-settings:{owner}"),"{}")).unwrap_or_default();
+        let visible=!owner.is_empty()&&settings.enabled;
+        let selected=self.media_stack.visible_child_name().as_deref()==Some("monero");
+        let old=self.media_toggles.borrow_mut().remove("monero");
+        if let Some(old)=old{self.media_tabs.remove(&old);}
+        if let Some(old)=self.media_stack.child_by_name("monero"){self.media_stack.remove(&old);}
+        self.sidebar_cards.borrow_mut().clear();
+        if visible {
+            let tab=adw::Toggle::builder().name("monero").label("Monero").build();
+            self.media_stack.add_named(&crate::monero_settings_ui::wallet_sidebar(self),Some("monero"));
+            self.media_tabs.add(tab.clone());self.media_toggles.borrow_mut().insert("monero".into(),tab);
+            if selected { self.media_stack.set_visible_child_name("monero"); }
+        }
+        self.update_mode();
+    }
+    pub fn toggle_media_tab(&self, name: &str) {
+        let selected = self.media_mode.borrow().as_str() == "media"
+            && self.utility.shows_sidebar()
+            && self.media_stack.visible_child_name().as_deref() == Some(name);
+        self.media_tabs.set_active_name(Some(name));
+        if selected {
+            self.utility.set_show_sidebar(false);
+        } else {
+            if self.media_mode.borrow().as_str() != "media" || !self.utility.shows_sidebar() {
+                self.toggle_media();
+            }
+        }
+    }
     pub fn toggle_media(&self) {
         if self.media_mode.borrow().as_str() != "media" {
             self.utility.set_sidebar(gtk::Widget::NONE);
@@ -133,34 +158,28 @@ impl Ui {
     pub fn show_info(self: &Rc<Self>) {
         let chat = self.state.borrow().current().clone();
         let demo = self.state.borrow().account.is_empty();
-        let pane = adw::ToolbarView::new();
-        pane.add_css_class("utility-sidebar");
-        let h = adw::HeaderBar::builder()
-            .show_start_title_buttons(false)
-            .title_widget(&label("Conversation Info", "heading"))
-            .build();
-        let close = icon_button("sidebar-show-symbolic", "Close conversation info");
+        let chrome = crate::components::UtilityPane::new(Some("Conversation Info"));
         let u = self.utility.downgrade();
-        close.connect_clicked(move |_| {
+        chrome.close("Close conversation info", false, move || {
             if let Some(u) = u.upgrade() {
                 u.set_show_sidebar(false)
             }
         });
-        h.pack_start(&close);
-        pane.add_top_bar(&h);
+        let pane = chrome.view;
         let body = bx(true, 16);
         margins(&body, 12);
         body.set_width_request(0);
         body.set_hexpand(true);
-        body.append(&self.chat_avatar(&chat, 76));
-        let title = wrap(&chat.name, "title-2");
+        let avatar=self.chat_avatar(&chat,76);
+        if chat.group{body.append(&avatar);}else{body.append(&self.profile_button(&avatar,&chat.jid,chat.display_name()));}
+        let title = wrap(chat.display_name(), "title-2");
         title.set_width_chars(1);
         title.set_max_width_chars(34);
         title.set_lines(3);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         title.set_xalign(0.5);
-        title.set_tooltip_text(Some(&chat.name));
-        title.update_property(&[gtk::accessible::Property::Label(&chat.name)]);
+        title.set_tooltip_text(Some(chat.display_name()));
+        title.update_property(&[gtk::accessible::Property::Label(chat.display_name())]);
         body.append(&title);
         let subtitle = wrap(&chat.subtitle, "dim-label");
         subtitle.set_width_chars(1);
@@ -184,22 +203,21 @@ impl Ui {
                 "security",
             ),
             ("Control Access", "changes-prevent-symbolic", "access"),
+            ("Local Details", "document-edit-symbolic", "local-contact"),
+            ("Suggest Picture…", "image-x-generic-symbolic", "suggest-avatar"),
         ] {
-            if key == "access" && !demo && !live_access {
+            if (key == "access" && !demo || matches!(key,"local-contact"|"suggest-avatar")) && !live_access {
                 continue;
             }
-            let row = adw::ActionRow::builder()
-                .title(title)
-                .activatable(true)
-                .build();
-            row.add_prefix(&gtk::Image::from_icon_name(icon));
-            row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+            let row = crate::components::NavRow::new(icon, title, None);
             let weak = Rc::downgrade(self);
             let peer = chat.jid.clone();
             row.connect_activated(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     match key {
                         "media" => ui.shared_media(),
+                        "local-contact" => ui.edit_contact_details(&peer),
+                        "suggest-avatar" => ui.suggest_contact_picture(&peer),
                         "security" => ui.security(),
                         _ if ui.state.borrow().account.is_empty() => {
                             ui.preview_form("Control Access", &["Contact address"])
@@ -251,26 +269,21 @@ impl Ui {
             self.live_shared_media();
             return;
         }
-        let pane = adw::ToolbarView::new();
-        pane.add_css_class("utility-sidebar");
-        pane.add_css_class("shared-media-sidebar");
-        pane.set_top_bar_style(adw::ToolbarStyle::Flat);
-        let header = adw::HeaderBar::builder()
-            .show_start_title_buttons(false)
-            .title_widget(&label("Shared Media", "heading"))
-            .build();
-        let back = icon_button("go-previous-symbolic", "Conversation info");
-        self.weak_button(&back, |ui| ui.show_info());
-        header.pack_start(&back);
-        let close = icon_button("sidebar-show-symbolic", "Close shared media");
+        let pane = crate::components::UtilityPane::new(Some("Shared Media"))
+            .with_class("shared-media-sidebar");
+        let weak = Rc::downgrade(self);
+        pane.back("Conversation info", move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.show_info();
+            }
+        });
         let utility = self.utility.downgrade();
-        close.connect_clicked(move |_| {
+        pane.close("Close shared media", true, move || {
             if let Some(u) = utility.upgrade() {
                 u.set_show_sidebar(false);
             }
         });
-        header.pack_end(&close);
-        pane.add_top_bar(&header);
+        let pane = pane.view;
         let items = self.shared_media_items();
         if items.is_empty() {
             let empty = adw::StatusPage::builder()
@@ -378,25 +391,30 @@ impl Ui {
     }
     pub fn refresh_stories(self: &Rc<Self>) {
         clear(&self.stories);
-        let mut owners = vec!["You".to_string()];
+        let account=self.state.borrow().account.clone();
+        let key=|story:&Story|if story.jid.is_empty(){story.owner.clone()}else{story.jid.clone()};
+        let mut owners = vec![if account.is_empty(){"You".to_string()}else{account.clone()}];
         for story in &self.state.borrow().stories {
-            if !owners.contains(&story.owner) {
-                owners.push(story.owner.clone())
+            if !story.url.is_empty() && chrono::Utc::now().timestamp_millis().saturating_sub(story.published)>=crate::stories::LIFETIME{continue;}
+            if !owners.contains(&key(story)) {
+                owners.push(key(story))
             }
         }
-        for owner in owners {
+        for owner_key in owners {
             let stories: Vec<_> = self
                 .state
                 .borrow()
                 .stories
                 .iter()
-                .filter(|s| s.owner == owner)
+                .filter(|s| key(s) == owner_key && (s.url.is_empty()||chrono::Utc::now().timestamp_millis().saturating_sub(s.published)<crate::stories::LIFETIME))
                 .cloned()
                 .collect();
+            let owner=stories.first().map(|s|s.owner.clone()).unwrap_or_else(||"You".into());
             let b = gtk::Button::new();
             b.add_css_class("story-button");
             let who = Chat {
                 name: owner.clone(),
+                jid: if account.is_empty(){String::new()}else{owner_key.clone()},
                 color: match owner.as_str() {
                     "Mira" => "pink",
                     "Sam" => "orange",
@@ -406,20 +424,11 @@ impl Ui {
                 .into(),
                 ..Default::default()
             };
-            let a = avatar(&who, 44);
-            a.add_css_class(if stories.iter().any(|s| !s.seen) {
-                "story-unread"
-            } else {
-                "story-seen"
-            });
-            let icon = gtk::Overlay::builder().child(&a).build();
+            let icon = crate::components::StoryAvatar::new(&self.chat_avatar(&who, 44));
+            icon.set_unseen(stories.iter().any(|s| !s.seen));
             if owner == "You" {
-                let add = gtk::Image::from_icon_name("list-add-symbolic");
-                add.set_halign(gtk::Align::End);
-                add.set_valign(gtk::Align::End);
-                add.add_css_class("story-add");
-                icon.add_overlay(&add);
-                self.context_actions(&b, vec![("Add Story…".into(), "story-new".into())]);
+                icon.set_add_badge(true);
+                self.context_actions(&b, vec![("Add Story…".into(), "story-new".into()),("Story History".into(),"story-history".into())]);
             }
             b.set_child(Some(&icon));
             b.set_tooltip_text(Some(&if owner == "You" && stories.is_empty() {
@@ -440,7 +449,7 @@ impl Ui {
             let weak = Rc::downgrade(self);
             b.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.open_story(&owner)
+                    ui.open_story(&owner_key)
                 }
             });
             self.stories.append(&content)
@@ -466,8 +475,8 @@ impl Ui {
             let s = self.state.borrow();
             s.stories
                 .iter()
-                .position(|s| s.owner == owner && !s.seen)
-                .or_else(|| s.stories.iter().position(|s| s.owner == owner))
+                .position(|s| (s.jid==owner || s.jid.is_empty()&&s.owner==owner) && !s.seen)
+                .or_else(|| s.stories.iter().position(|s| s.jid==owner || s.jid.is_empty()&&s.owner==owner))
         };
         let Some(index) = index else {
             self.new_story();
@@ -478,13 +487,20 @@ impl Ui {
         self.overlay.add_overlay(&viewer.root);
         viewer.open();
     }
+    pub(crate) fn open_story_item(self:&Rc<Self>,story:Story){
+        let index={let mut state=self.state.borrow_mut();if let Some(index)=state.stories.iter().position(|s|s.jid==story.jid&&s.id==story.id){index}else{state.stories.push(story);state.stories.len()-1}};
+        let viewer=StoryViewer::new(self,index);self.active_story.replace(Some(viewer.clone()));self.overlay.add_overlay(&viewer.root);viewer.open();
+    }
     pub fn new_story(self: &Rc<Self>) {
+        if !self.state.borrow().account.is_empty() && self.pending_story() { return; }
         let chooser = gtk::FileDialog::builder()
             .title("Add Story")
             .modal(true)
             .build();
         let filter = gtk::FileFilter::new();
         filter.add_mime_type("image/*");
+        filter.add_mime_type("video/mp4");
+        filter.add_mime_type("video/webm");
         let filters = gio::ListStore::new::<gtk::FileFilter>();
         filters.append(&filter);
         chooser.set_filters(Some(&filters));
@@ -496,6 +512,7 @@ impl Ui {
             };
             let Some(ui) = weak.upgrade() else { return };
             if !ui.state.borrow().account.is_empty() {
+                ui.new_live_story(file);
                 return;
             }
             let Some(path) = file.path() else {
@@ -560,6 +577,7 @@ mod fly_imp {
     #[derive(Default)]
     pub struct FlyFrame {
         pub progress: Cell<f64>,
+        pub story_transition: Cell<bool>,
         pub zoom: Cell<f64>,
         pub pan: Cell<(f64, f64)>,
         pub clip_radii: Cell<[f32; 4]>,
@@ -587,6 +605,13 @@ mod fly_imp {
             let p = self.progress.get();
             let mut clipped = false;
             s.save();
+            if self.story_transition.get() && p < 1. {
+                let scale=(0.94+0.06*p) as f32;
+                let cx=obj.width() as f32/2.;let cy=obj.height() as f32/2.;
+                s.translate(&graphene::Point::new(cx,cy+16.*(1.-p) as f32));
+                s.scale(scale,scale);
+                s.translate(&graphene::Point::new(-cx,-cy));
+            }
             if p < 1. {
                 if let (Some(origin), Some(overlay)) =
                     (*self.origin.borrow(), self.overlay.upgrade())
@@ -713,11 +738,15 @@ pub struct MediaViewer {
     generation: u64,
     preview_status: gtk::Label,
     fullscreen: gtk::Button,
+    /// Opens the picture in Edit Picture; the edited copy goes into the message being written.
+    edit: gtk::Button,
     previous: gtk::Button,
     next: gtk::Button,
     video_controls: gtk::Revealer,
     controls_mount: gtk::Box,
     replay_mount: gtk::Box,
+    motion_button: gtk::Button,
+    motions: RefCell<HashMap<String,Rc<crate::motion_photo_ui::MotionPhoto>>>,
     active_video: RefCell<Option<Rc<crate::video_ui::Playback>>>,
     playbacks: RefCell<HashMap<String, Rc<crate::video_ui::Playback>>>,
     progress: Cell<f64>,
@@ -764,6 +793,13 @@ fn message_media_source(widget: &gtk::Widget, id: &str) -> Option<gtk::Widget> {
         }
     }
     None
+}
+
+/// Whether the gallery shows its Edit button: when signed in, unless the media is known to be
+/// something the editor never takes (a video or a sticker). When nothing is known yet, for example
+/// while the neighbouring pictures are still loading, it stays shown rather than vanishing.
+fn edit_button_shown(signed_in: bool, attachment: Option<&crate::file_share::Attachment>) -> bool {
+    signed_in && attachment.is_none_or(|file| !file.video_candidate() && !file.sticker)
 }
 
 impl MediaViewer {
@@ -841,8 +877,13 @@ impl MediaViewer {
         header.set_title_widget(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
         let download = icon_button("folder-download-symbolic", "Download a copy");
         download.set_visible(!ui.state.borrow().account.is_empty());
+        let edit = icon_button("document-edit-symbolic", "Edit a copy and add it to your message");
+        edit.set_visible(!ui.state.borrow().account.is_empty());
         let fullscreen = icon_button("view-fullscreen-symbolic", "Fullscreen");
         let end_controls = bx(false, 0);
+        let motion_button=crate::motion_photo_ui::button();
+        end_controls.append(&motion_button);
+        end_controls.append(&edit);
         end_controls.append(&download);
         end_controls.append(&fullscreen);
         header.pack_end(&end_controls);
@@ -936,11 +977,14 @@ impl MediaViewer {
             preview_status,
             items: RefCell::new(items),
             fullscreen,
+            edit: edit.clone(),
             previous,
             next,
             video_controls,
             controls_mount,
             replay_mount,
+            motion_button,
+            motions: RefCell::new(HashMap::new()),
             active_video: RefCell::new(None),
             playbacks: RefCell::new(HashMap::new()),
             progress: Cell::new(0.),
@@ -962,6 +1006,59 @@ impl MediaViewer {
             if let Some(v) = weak.upgrade() {
                 v.close()
             }
+        });
+        let weak = Rc::downgrade(&viewer);
+        edit.connect_clicked(move |_| {
+            let Some(viewer) = weak.upgrade() else { return };
+            let Some(ui) = viewer.ui.upgrade().filter(|ui| {
+                ui.generation.get() == viewer.generation
+                    && ui.state.borrow().account == viewer.owner
+                    && ui.state.borrow().current().jid == viewer.peer
+            }) else {
+                return;
+            };
+            let id = viewer.items.borrow()[viewer.index.get()].id.clone();
+            let Some(file) = ui
+                .store
+                .message(&viewer.owner, &viewer.peer, &id)
+                .filter(|message| !message.retracted)
+                .and_then(|message| message.attachment)
+            else {
+                ui.notice("This media is no longer available");
+                return;
+            };
+            let path = match ui.downloads.borrow().status(&viewer.owner, &file) {
+                Some(crate::downloads::Status::Ready(path)) if path.is_file() => path,
+                _ => {
+                    ui.notice("Wait for this picture to finish downloading, then edit it");
+                    return;
+                }
+            };
+            // Judged by what the file is, not what it is called.
+            if let Err(reason) = crate::picture_editor_ui::check_editable_file(&path) {
+                ui.notice(reason);
+                return;
+            }
+            // The edit is a new picture: it never replaces the one in the chat. When Done is pressed
+            // it is added to the message being written, where a caption can go with it and Send
+            // sends it.
+            let (owner, peer, viewer_weak, ui_weak) = (viewer.owner.clone(), viewer.peer.clone(), weak.clone(), Rc::downgrade(&ui));
+            ui.open_picture_editor(path, move |edited| {
+                let Some(ui) = ui_weak.upgrade() else {
+                    crate::picture_editor_ui::discard_edited(Some(edited));
+                    return;
+                };
+                match ui.accept_edited_copy(&owner, &peer, edited) {
+                    Ok(()) => {
+                        if let Some(viewer) = viewer_weak.upgrade() {
+                            viewer.close();
+                        }
+                        ui.show_chat();
+                        ui.notice("Edited copy added to your message. Press Send to send it");
+                    }
+                    Err(reason) => ui.notice(reason),
+                }
+            });
         });
         let weak = Rc::downgrade(&viewer);
         download.connect_clicked(move |_| {
@@ -1078,10 +1175,19 @@ impl MediaViewer {
             if !inside {
                 viewer.close();
             } else {
+                let id=viewer.items.borrow()[viewer.index.get()].id.clone();
+                if let Some(motion)=viewer.motions.borrow().get(&id){motion.play();}
                 viewer.reveal_controls();
             }
         });
         viewer.root.add_controller(click);
+        let weak=Rc::downgrade(&viewer);
+        viewer.motion_button.connect_clicked(move |_|{
+            if let Some(viewer)=weak.upgrade(){
+                let id=viewer.items.borrow()[viewer.index.get()].id.clone();
+                if let Some(motion)=viewer.motions.borrow().get(&id){motion.play();}
+            }
+        });
         let context = gtk::GestureClick::new();
         context.set_button(gdk::BUTTON_SECONDARY);
         context.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1202,6 +1308,7 @@ impl MediaViewer {
         }
     }
     pub fn open(self: &Rc<Self>) {
+        self.refresh_edit();
         if let Some(source) = self
             .source
             .borrow()
@@ -1233,6 +1340,17 @@ impl MediaViewer {
         a.play();
         self.animation.replace(Some(a));
     }
+    /// The Edit button is there on pictures and always clickable: what the editor can open is
+    /// decided from the downloaded file's header when it is pressed, which can then say why not,
+    /// instead of a button greyed out or missing for a reason nobody can see.
+    fn refresh_edit(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let id = self.items.borrow().get(self.index.get()).map(|item| item.id.clone());
+        let attachment = id.and_then(|id| ui.store.message(&self.owner, &self.peer, &id)).and_then(|message| message.attachment);
+        self.edit.set_visible(edit_button_shown(!self.owner.is_empty(), attachment.as_ref()));
+        self.edit.set_sensitive(true);
+        self.edit.set_tooltip_text(Some("Edit a copy and add it to your message"));
+    }
     fn move_by(self: &Rc<Self>, delta: i32) {
         if self.closing.get() {
             return;
@@ -1250,6 +1368,7 @@ impl MediaViewer {
             self.clear_close_targets();
         }
         self.index.set(index);
+        self.refresh_edit();
         self.update_position(delta);
         self.root.grab_focus();
         if !self.owner.is_empty() {
@@ -1380,6 +1499,9 @@ impl MediaViewer {
         let old = self.frames.replace(frames);
         self.pictures.replace(pictures);
         self.items.replace(items);
+        // Only now do the index and the items agree, so only now can the button be judged.
+        self.refresh_edit();
+        self.motions.borrow_mut().retain(|id,_|self.items.borrow().iter().any(|item|&item.id==id));
         for frame in old {
             if !self.frames.borrow().iter().any(|f| f == &frame) {
                 self.stack.remove(&frame);
@@ -1434,6 +1556,8 @@ impl MediaViewer {
                 return glib::ControlFlow::Continue;
             }
             let current = index == active;
+            if current {viewer.motion_button.set_visible(viewer.motions.borrow().contains_key(&id));}
+            else {viewer.motions.borrow_mut().remove(&id);}
             let edge = if current { 4096 } else { 384 };
             let Some(message) = ui
                 .store
@@ -1544,21 +1668,15 @@ impl MediaViewer {
             if let Some(path) = ui.cached_image_source(&file) {
                 match ui.image(&file, &path, edge) {
                     Some(Ok(image)) => {
-                        if ui
-                            .store
-                            .remember_image(
-                                &viewer.owner,
-                                &viewer.peer,
-                                &id,
-                                &file,
-                                &image.mime,
-                                image.width,
-                                image.height,
-                                image.animated,
-                            )
-                            .unwrap_or(false)
                         {
+                            ui.remember_media_metadata(&viewer.owner,&viewer.peer,&id,&file,&image.mime,image.width,image.height,image.animated);
                             picture.set_paintable(Some(&image.texture));
+                            if current && image.motion.is_some() && !viewer.motions.borrow().contains_key(&id) {
+                                let draw=picture.downgrade();let active=Rc::downgrade(&viewer);let target_id=id.clone();
+                                let controller=crate::motion_photo_ui::MotionPhoto::new(&ui,&file,&path,&picture,&viewer.motion_button,image.texture.clone().upcast(),move |paintable|{if let Some(picture)=draw.upgrade(){picture.set_paintable(Some(paintable));}},move ||active.upgrade().is_some_and(|viewer|!viewer.closing.get()&&viewer.items.borrow()[viewer.index.get()].id==target_id));
+                                viewer.motions.borrow_mut().insert(id.clone(),controller);
+                                if current {viewer.motion_button.set_visible(true);}
+                            }
                             if current && image.animated && !playing {
                                 playing = true;
                                 let weak = Rc::downgrade(&viewer);
@@ -1614,11 +1732,7 @@ impl MediaViewer {
         menu.add_css_class("message-menu-panel");
         for (title, copy) in [("Copy Media", true), ("Save As…", false)] {
             let button = gtk::Button::with_label(title);
-            button.add_css_class("flat");
-            button.add_css_class("context-menu-row");
-            if let Some(label) = button.child().and_downcast::<gtk::Label>() {
-                label.set_xalign(0.);
-            }
+            crate::widgets::style_context_button(&button);
             let weak = Rc::downgrade(&ui);
             let viewer = Rc::downgrade(self);
             let popup = popover.downgrade();
@@ -1860,6 +1974,7 @@ pub struct StoryViewer {
     ui: Weak<Ui>,
     index: Cell<usize>,
     picture: gtk::Picture,
+    card: FlyFrame,
     caption: gtk::Label,
     owner: gtk::Label,
     avatar: adw::Avatar,
@@ -1875,8 +1990,65 @@ pub struct StoryViewer {
     closing: Cell<bool>,
     timer: RefCell<Option<glib::SourceId>>,
     animation: RefCell<Option<adw::TimedAnimation>>,
+    current: RefCell<Option<Story>>,
+    loading: Cell<bool>,
+    load_revision: Cell<u64>,
+    load_cancel: RefCell<Option<gio::Cancellable>>,
+    player: RefCell<Option<Rc<crate::video_ui::Playback>>>,
+    status: gtk::Label,
+    spinner: gtk::Spinner,
+    retry: gtk::Button,
+    edit:gtk::Button,
+    delete:gtk::Button,
 }
 impl StoryViewer {
+    fn load_story_media(self:&Rc<Self>,ui:&Rc<Ui>,story:&Story){
+        let Some(mut attachment)=crate::file_share::Attachment::bare(&story.url)else{self.media_failed("This story has an invalid media address");return;};attachment.mime=story.mime.clone();
+        let account=ui.state.borrow().account.clone();let revision=self.load_revision.get();let weak=Rc::downgrade(self);let story=story.clone();
+        // Own uploads already retain an immutable private snapshot.
+        if !story.asset.is_empty() {self.decode_story_media(std::path::PathBuf::from(&story.asset),attachment,story.mime.starts_with("video/"),revision,account);return;}
+        if let Err(error)=ui.downloads.borrow_mut().start(&account,attachment.clone()){self.media_failed(error);return;}
+        glib::timeout_add_local(Duration::from_millis(80),move||{
+            let Some(viewer)=weak.upgrade().filter(|v|!v.closing.get()&&v.load_revision.get()==revision)else{return glib::ControlFlow::Break;};let Some(ui)=viewer.ui.upgrade().filter(|ui|ui.state.borrow().account==account)else{return glib::ControlFlow::Break;};
+            let status=ui.downloads.borrow().status(&account,&attachment);
+            match status {
+                Some(crate::downloads::Status::Ready(path))=>{viewer.decode_story_media(path,attachment.clone(),story.mime.starts_with("video/"),revision,account.clone());return glib::ControlFlow::Break;},
+                Some(crate::downloads::Status::Running{bytes,total,reconnecting})=>viewer.status.set_text(&if reconnecting{"Reconnecting to download server…".into()}else if let Some(total)=total{format!("Downloading story: {} of {}",glib::format_size(bytes),glib::format_size(total))}else{format!("Downloading story: {}",glib::format_size(bytes))}),
+                Some(crate::downloads::Status::Failed(error))=>{viewer.media_failed(error);return glib::ControlFlow::Break;},
+                Some(crate::downloads::Status::Cancelled)=>{viewer.media_failed("Download cancelled. Retry to view this story.");return glib::ControlFlow::Break;},
+                _=>{},
+            }glib::ControlFlow::Continue
+        });
+    }
+    fn media_failed(&self,reason:&str){self.spinner.set_spinning(false);self.spinner.set_visible(false);self.status.set_text(reason);self.retry.set_visible(true);self.loading.set(true);}
+    fn decode_story_media(self:&Rc<Self>,path:std::path::PathBuf,attachment:crate::file_share::Attachment,video:bool,revision:u64,account:String){
+        let cancel=gio::Cancellable::new();self.load_cancel.replace(Some(cancel.clone()));self.status.set_text("Opening story…");let weak=Rc::downgrade(self);
+        let animated=matches!(attachment.mime.as_str(),"image/gif"|"image/webp");let animation_path=path.clone();let animation_file=attachment.clone();
+        glib::spawn_future_local(async move{
+            let result=gio::spawn_blocking(move||{
+                use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+                let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();cancel.connect_cancelled(move |_|signal.store(true,Ordering::Release));
+                let input=crate::downloads::verified_input(&path,&attachment,&stop)?;
+                if video {if !crate::video_ui::initialize(){return Err("Video playback is unavailable");}return Ok((None,Some(input)));}
+                let mut decoder=crate::image_loader::Decoder::open(input,&cancel)?;
+                if !matches!(decoder.mime.as_str(),"image/jpeg"|"image/png"|"image/webp"|"image/gif"){return Err("Unsupported story image");}
+                Ok::<_,&str>((Some(decoder.frame(1080)?.texture),None))
+            }).await;
+            let Some(viewer)=weak.upgrade().filter(|v|!v.closing.get()&&v.load_revision.get()==revision)else{return;};let Some(ui)=viewer.ui.upgrade().filter(|ui|ui.state.borrow().account==account)else{return;};
+            match result {
+                Ok(Ok((image,input)))=>{
+                    if let Some(image)=image{viewer.picture.set_paintable(Some(&image));if animated{let visible=Rc::downgrade(&viewer);crate::image_loader::play(&viewer.picture,animation_path,animation_file,1080,move |_|visible.upgrade().is_some_and(|v|!v.closing.get()&&v.load_revision.get()==revision&&!v.pause.is_active()&&!v.held.get()),|picture,frame|picture.set_paintable(Some(&frame)));}}
+                    else if let Some(input)=input{let Some(player)=crate::video_ui::Playback::new(input)else{viewer.media_failed("Video playback could not start. Retry this story.");return;};player.media.set_loop(false);player.media.set_muted(false);viewer.picture.set_paintable(Some(&player.media));if !viewer.pause.is_active(){player.media.play();}viewer.player.replace(Some(player));}
+                    viewer.spinner.set_spinning(false);viewer.spinner.set_visible(false);viewer.status.set_text("");viewer.retry.set_visible(false);viewer.loading.set(false);viewer.last.set(Instant::now());
+                    if let Some(story)=viewer.current.borrow_mut().as_mut(){story.seen=true;let (peer,id)=(story.jid.clone(),story.id.clone());for current in &mut ui.state.borrow_mut().stories{if current.jid==peer&&current.id==id{current.seen=true;}}
+                        let weak=Rc::downgrade(&ui);glib::spawn_future_local(async move{if let Some(ui)=weak.upgrade(){let _=ui.store.write_snapshot(move|store|store.stories_mark_seen(&account,&peer,&id)).await;}});
+                    }ui.refresh_stories();
+                },
+                Ok(Err(error))=>viewer.media_failed(error),Err(_)=>viewer.media_failed("Opening this story was interrupted. Retry the download."),
+            }
+        });
+    }
+    fn duration(&self)->f64{self.player.borrow().as_ref().map(|p|p.media.duration() as f64/1_000_000.).filter(|d|*d>0.).unwrap_or(5.).clamp(1.,600.)}
     pub fn new(ui: &Rc<Ui>, index: usize) -> Rc<Self> {
         let root = gtk::Overlay::builder()
             .hexpand(true)
@@ -1893,7 +2065,11 @@ impl StoryViewer {
             .hexpand(true)
             .vexpand(true)
             .build();
-        root.set_child(Some(&frame));
+        let card:FlyFrame=glib::Object::new();
+        card.set_hexpand(true);card.set_vexpand(true);
+        card.imp().story_transition.set(true);card.imp().zoom.set(1.);
+        card.append(&frame);
+        root.set_child(Some(&card));
         let picture = gtk::Picture::builder()
             .can_shrink(true)
             .content_fit(gtk::ContentFit::Cover)
@@ -1901,6 +2077,8 @@ impl StoryViewer {
             .vexpand(true)
             .build();
         stage.set_child(Some(&picture));
+        let loading = bx(true, 8);loading.set_halign(gtk::Align::Center);loading.set_valign(gtk::Align::Center);
+        let spinner=gtk::Spinner::new();let status=wrap("", "caption");let retry=gtk::Button::with_label("Retry Download");retry.set_visible(false);loading.append(&spinner);loading.append(&status);loading.append(&retry);stage.add_overlay(&loading);
         let top = bx(true, 10);
         top.set_valign(gtk::Align::Start);
         top.add_css_class("story-top");
@@ -1922,6 +2100,8 @@ impl StoryViewer {
             .build();
         pause.add_css_class("flat");
         controls.append(&pause);
+        let edit=icon_button("document-edit-symbolic","Edit story caption");controls.append(&edit);
+        let delete=icon_button("user-trash-symbolic","Delete story");controls.append(&delete);
         let close = icon_button("window-close-symbolic", "Close story");
         controls.append(&close);
         top.append(&controls);
@@ -1962,6 +2142,7 @@ impl StoryViewer {
             ui: Rc::downgrade(ui),
             index: Cell::new(index),
             picture,
+            card,
             caption,
             owner,
             avatar,
@@ -1977,7 +2158,12 @@ impl StoryViewer {
             closing: Cell::new(false),
             timer: RefCell::new(None),
             animation: RefCell::new(None),
+            current: RefCell::new(None), loading: Cell::new(false), load_revision: Cell::new(0), load_cancel: RefCell::new(None), player: RefCell::new(None), status, spinner, retry, edit:edit.clone(),delete:delete.clone(),
         });
+        let weak=Rc::downgrade(&v);v.retry.connect_clicked(move |_|{if let Some(v)=weak.upgrade(){v.load();}});
+        let weak=Rc::downgrade(&v);v.pause.connect_toggled(move |button|{if let Some(v)=weak.upgrade(){if let Some(player)=v.player.borrow().as_ref(){if button.is_active(){player.media.pause();}else{player.media.play();}}}});
+        let weak=Rc::downgrade(&v);edit.connect_clicked(move |_|{if let Some(v)=weak.upgrade(){let story=v.current.borrow().clone();if let (Some(ui),Some(story))=(v.ui.upgrade(),story){if story.own{v.close();ui.edit_story_caption(story);}}}});
+        let weak=Rc::downgrade(&v);delete.connect_clicked(move |_|{if let Some(v)=weak.upgrade(){let story=v.current.borrow().clone();if let (Some(ui),Some(story))=(v.ui.upgrade(),story){if story.own{v.close();ui.delete_story(story);}}}});
         let weak = Rc::downgrade(&v);
         close.connect_clicked(move |_| {
             if let Some(v) = weak.upgrade() {
@@ -2041,7 +2227,20 @@ impl StoryViewer {
             }
         });
         v.picture.add_controller(click);
+        let background=gtk::GestureClick::new();
+        background.set_button(gdk::BUTTON_PRIMARY);
+        background.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak=Rc::downgrade(&v);let stage=stage.downgrade();
+        background.connect_released(move |gesture,presses,x,y|{
+            let (Some(v),Some(stage))=(weak.upgrade(),stage.upgrade())else{return;};
+            if presses!=1{return;}
+            let mut target=v.root.pick(x,y,gtk::PickFlags::DEFAULT);
+            while let Some(widget)=target{if widget.is::<gtk::Button>()||widget.is::<gtk::Editable>(){return;}target=widget.parent();}
+            if stage.compute_bounds(&v.root).is_some_and(|bounds|!bounds.contains_point(&graphene::Point::new(x as f32,y as f32))){gesture.set_state(gtk::EventSequenceState::Claimed);v.close();}
+        });
+        v.root.add_controller(background);
         let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(&v);
         key.connect_key_pressed(move |_, k, _, _| {
             if let Some(v) = weak.upgrade() {
@@ -2069,16 +2268,18 @@ impl StoryViewer {
         v.load();
         v
     }
-    fn load(&self) {
+    fn load(self: &Rc<Self>) {
+        if let Some(cancel)=self.load_cancel.borrow_mut().take(){cancel.cancel();}
+        self.load_revision.set(self.load_revision.get().wrapping_add(1));self.player.borrow_mut().take();
         let Some(ui) = self.ui.upgrade() else { return };
         let story = {
             let mut s = ui.state.borrow_mut();
             let Some(story) = s.stories.get_mut(self.index.get()) else {
                 return;
             };
-            story.seen = true;
             story.clone()
         };
+        self.current.replace(Some(story.clone()));
         self.elapsed.set(0.);
         self.owner.set_text(&story.owner);
         self.avatar.set_text(Some(&story.owner));
@@ -2086,16 +2287,19 @@ impl StoryViewer {
         self.like.set_active(story.liked);
         self.reply.set_text("");
         self.reply.set_visible(!story.own);
-        let path = std::path::PathBuf::from(&story.asset);
-        self.picture.set_filename(Some(if path.is_absolute() {
-            path
-        } else {
-            asset(&story.asset)
-        }));
+        self.edit.set_visible(story.own&&!story.id.is_empty()&&chrono::Utc::now().timestamp_millis().saturating_sub(story.published)<crate::stories::LIFETIME);
+        self.delete.set_visible(story.own&&!story.id.is_empty());
+        self.like.set_visible(ui.state.borrow().account.is_empty());
+        if story.url.is_empty(){
+            let path=std::path::PathBuf::from(&story.asset);self.picture.set_filename(Some(if path.is_absolute(){path}else{asset(&story.asset)}));self.loading.set(false);
+        }else{
+            self.picture.set_paintable(None::<&gdk::Paintable>);self.loading.set(true);self.status.set_text("Downloading story…");self.spinner.set_spinning(true);self.spinner.set_visible(true);self.retry.set_visible(false);
+            self.load_story_media(&ui,&story);
+        }
         clear(&self.segments);
         self.bars.borrow_mut().clear();
         for (i, other) in ui.state.borrow().stories.iter().enumerate() {
-            if other.owner == story.owner {
+            if if story.jid.is_empty(){other.owner==story.owner}else{other.jid==story.jid} {
                 let p = gtk::ProgressBar::new();
                 p.set_hexpand(true);
                 self.segments.append(&p);
@@ -2110,7 +2314,7 @@ impl StoryViewer {
             b.set_fraction(if *i < self.index.get() {
                 1.
             } else if *i == self.index.get() {
-                (self.elapsed.get() / 5.).min(1.)
+                (self.elapsed.get() / self.duration()).min(1.)
             } else {
                 0.
             })
@@ -2118,6 +2322,7 @@ impl StoryViewer {
     }
     pub fn open(self: &Rc<Self>) {
         self.root.set_opacity(0.);
+        self.card.imp().progress.set(0.);self.card.queue_draw();
         self.root.grab_focus();
         let weak = Rc::downgrade(self);
         let a = adw::TimedAnimation::new(
@@ -2127,7 +2332,8 @@ impl StoryViewer {
             200,
             adw::CallbackAnimationTarget::new(move |p| {
                 if let Some(v) = weak.upgrade() {
-                    v.root.set_opacity(p)
+                    v.root.set_opacity(p);
+                    v.card.imp().progress.set(p);v.card.queue_draw();
                 }
             }),
         );
@@ -2149,6 +2355,7 @@ impl StoryViewer {
                 .min(0.1);
             let active = v.ui.upgrade().is_some_and(|u| u.window.is_active());
             if active
+                && !v.loading.get()
                 && !v.held.get()
                 && !v.pause.is_active()
                 && !v
@@ -2158,7 +2365,7 @@ impl StoryViewer {
             {
                 v.elapsed.set(v.elapsed.get() + delta);
                 v.progress();
-                if v.elapsed.get() >= 5. {
+                if v.elapsed.get() >= v.duration() {
                     v.move_by(1)
                 }
             }
@@ -2182,9 +2389,11 @@ impl StoryViewer {
             return;
         }
         let Some(ui) = self.ui.upgrade() else { return };
-        let Some(story) = ui.state.borrow().stories.get(self.index.get()).cloned() else {
-            return;
-        };
+        let Some(story) = self.current.borrow().clone() else { return; };
+        if !story.jid.is_empty(){
+            let id={ui.state.borrow_mut().chat_for(&story.jid).id.clone()};ui.select_chat(&id);
+            ui.queue_text(&format!("Reply to story: {}\n{}",if story.caption.is_empty(){story.url.as_str()}else{story.caption.as_str()},value.trim()));self.close();return;
+        }
         let id = {
             let mut s = ui.state.borrow_mut();
             if let Some(c) = s.chats.iter().find(|c| c.name == story.owner) {
@@ -2210,6 +2419,8 @@ impl StoryViewer {
         if self.closing.replace(true) {
             return;
         }
+        if let Some(cancel)=self.load_cancel.borrow_mut().take(){cancel.cancel();}
+        self.player.borrow_mut().take();
         if let Some(id) = self.timer.borrow_mut().take() {
             id.remove()
         }
@@ -2224,7 +2435,8 @@ impl StoryViewer {
             180,
             adw::CallbackAnimationTarget::new(move |p| {
                 if let Some(v) = weak.upgrade() {
-                    v.root.set_opacity(p)
+                    v.root.set_opacity(p);
+                    v.card.imp().progress.set(p);v.card.queue_draw();
                 }
             }),
         );
@@ -2239,11 +2451,114 @@ impl StoryViewer {
                     .is_some_and(|active| Rc::ptr_eq(active, &v))
                 {
                     ui.active_story.borrow_mut().take();
+                    ui.mark_visible_chat_read();
                 }
             }
             v.animation.borrow_mut().take();
         });
         self.animation.replace(Some(a.clone()));
         a.play();
+    }
+}
+
+#[cfg(test)]mod story_native_tests{
+    use super::*;
+    fn wait(mut ready:impl FnMut()->bool){let ctx=glib::MainContext::default();let end=Instant::now()+Duration::from_secs(7);while Instant::now()<end{for _ in 0..50{if !ctx.pending(){break;}ctx.iteration(false);}if ready(){return;}std::thread::sleep(Duration::from_millis(2));}assert!(ready(),"story media did not settle");}
+    #[test]#[ignore="requires private GTK display and image loader sandbox"]
+    fn live_story_snapshot_decodes_off_thread_and_marks_seen(){
+        let app=adw::Application::builder().application_id("com.negzero.MonogramStoryMediaFixture").flags(gio::ApplicationFlags::NON_UNIQUE).build();app.register(None::<&gio::Cancellable>).unwrap();let ui=Ui::new(&app,true);let owner="alice@example.invalid";
+        ui.store.save_account(&Account{jid:owner.into(),host:String::new(),port:5222,direct_tls:false}).unwrap();let peer="bob@example.invalid";let mut state=State::live(owner,vec![Chat{id:"friend".into(),jid:peer.into(),name:"Friend".into(),..Default::default()}]);state.current_mut().messages.push(Message{id:"initial".into(),sender:peer.into(),text:"Initial chat row".into(),timestamp:"2026-11-15T10:00:00Z".into(),..Default::default()});ui.store.save(&state).unwrap();ui.activate_state(state);ui.window.present();wait(||ui.window.is_mapped());
+        let windows=std::process::Command::new("xdotool").args(["search","--onlyvisible","--pid",&std::process::id().to_string(),"--name","^Monogram$"]).output().unwrap();let window=String::from_utf8(windows.stdout).unwrap().lines().next().unwrap().to_owned();assert!(std::process::Command::new("xdotool").args(["windowfocus","--sync",&window]).status().unwrap().success());wait(||ui.reading_current_chat());
+        let image=gdk::MemoryTexture::new(64,64,gdk::MemoryFormat::R8g8b8a8,&glib::Bytes::from_owned(vec![255;64*64*4]),64*4);let path=std::env::temp_dir().join(format!("monogram-story-fixture-{}.png",new_id()));std::fs::write(&path,image.save_to_png_bytes()).unwrap();
+        let entry=crate::stories::Entry{id:"media-fixture".into(),owner:owner.into(),url:"https://example.invalid/story.png".into(),mime:"image/png".into(),caption:"Media fixture".into(),published:chrono::Utc::now().timestamp_millis()};ui.store.stories_replace(owner,owner,&[entry.clone()],entry.published).unwrap();
+        gtk::Settings::default().unwrap().set_property("gtk-enable-animations",true);
+        let started=Instant::now();ui.open_story_item(Story{owner:"You".into(),id:entry.id.clone(),jid:owner.into(),url:entry.url,mime:entry.mime,published:entry.published,caption:entry.caption,asset:path.to_string_lossy().into_owned(),own:true,..Default::default()});assert!(started.elapsed()<Duration::from_millis(400));let viewer=ui.active_story.borrow().as_ref().unwrap().clone();assert!(viewer.loading.get());
+        let frames=Rc::new(RefCell::new(Vec::new()));let samples=frames.clone();let card=viewer.card.downgrade();let clock=ui.window.frame_clock().unwrap();
+        let animation_signal=clock.connect_after_paint(move |_|{if let Some(card)=card.upgrade(){samples.borrow_mut().push(card.imp().progress.get());}});
+        wait(||viewer.card.imp().progress.get()>=0.999);
+        assert!(frames.borrow().iter().any(|p|*p>0.&&*p<1.),"entry needs rendered intermediate transform frames");
+        wait(||!viewer.loading.get()&&viewer.picture.paintable().is_some());wait(||ui.store.stories_seen(owner,owner,&entry.id).unwrap());assert!(viewer.edit.is_visible()&&viewer.delete.is_visible());assert!(!ui.reading_current_chat(),"story overlay suspends underlying-chat reads");
+        ui.receive_message(owner,peer.into(),Message{id:"behind-story".into(),wire_id:"behind-story".into(),sender:peer.into(),text:"Arrived behind story".into(),timestamp:"2026-11-15T11:00:00Z".into(),..Default::default()},false,None);assert_eq!(ui.state.borrow().current().unread,1);
+        let bounds=viewer.root.compute_bounds(&ui.window).unwrap();
+        assert!(std::process::Command::new("xdotool").args(["mousemove","--sync","--window",&window,&(bounds.x()+2.).round().to_string(),&(bounds.y()+bounds.height()-4.).round().to_string(),"click","1"]).status().unwrap().success());
+        wait(||ui.active_story.borrow().is_none());
+        assert!(frames.borrow().windows(2).any(|p|p[1]>0.&&p[1]<p[0]),"exit needs rendered intermediate transform frames");clock.disconnect(animation_signal);
+        wait(||ui.state.borrow().current().unread==0&&ui.store.unread_count(owner,peer)==0);
+        let video_path=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reaction-video.mp4");let video_entry=crate::stories::Entry{id:"video-fixture".into(),owner:owner.into(),url:"https://example.invalid/story.mp4".into(),mime:"video/mp4".into(),caption:"Video fixture".into(),published:chrono::Utc::now().timestamp_millis()};ui.store.stories_replace(owner,owner,&[video_entry.clone()],video_entry.published).unwrap();
+        ui.open_story_item(Story{owner:"You".into(),id:video_entry.id.clone(),jid:owner.into(),url:video_entry.url,mime:video_entry.mime,published:video_entry.published,caption:video_entry.caption,asset:video_path.to_string_lossy().into_owned(),own:true,..Default::default()});let video=ui.active_story.borrow().as_ref().unwrap().clone();video.pause.set_active(true);wait(||!video.loading.get()&&video.player.borrow().is_some());assert!(video.picture.paintable().is_some());ui.composer.buffer().set_text("Keep this draft");
+        let again=video.current.borrow().clone().unwrap();video.root.grab_focus();
+        assert!(std::process::Command::new("xdotool").args(["key","Escape"]).status().unwrap().success());wait(||ui.active_story.borrow().is_none());assert_eq!(ui.composer_text(),"Keep this draft");
+        gtk::Settings::default().unwrap().set_property("gtk-enable-animations",false);
+        ui.open_story_item(again);let video=ui.active_story.borrow().as_ref().unwrap().clone();assert_eq!(video.card.imp().progress.get(),1.);video.pause.set_active(true);wait(||!video.loading.get());video.reply.grab_focus();video.reply.set_text("Unsent reply");
+        assert!(std::process::Command::new("xdotool").args(["key","Escape"]).status().unwrap().success());wait(||ui.active_story.borrow().is_none());assert_eq!(ui.composer_text(),"Keep this draft");assert!(video.player.borrow().is_none());ui.window.close();std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod edit_button_tests {
+    use super::edit_button_shown;
+    use crate::file_share::Attachment;
+
+    fn media(name: &str, mime: &str, sticker: bool) -> Attachment {
+        Attachment {
+            wire_url: String::new(),
+            name: name.into(),
+            mime: mime.into(),
+            size: None,
+            width: None,
+            height: None,
+            hashes: Default::default(),
+            manual: false,
+            sticker,
+            voice: false,
+        }
+    }
+
+    #[test]
+    fn the_edit_button_shows_on_pictures_whatever_they_are_called() {
+        for (name, mime) in [("photo.jpg", "image/jpeg"), ("1f3c9a7e", "image/png"), ("pic", ""), ("a.gif", "image/gif"), ("a.avif", "image/avif")] {
+            assert!(edit_button_shown(true, Some(&media(name, mime, false))), "{name} {mime}");
+        }
+    }
+
+    #[test]
+    fn it_stays_while_nothing_is_known_yet_instead_of_vanishing() {
+        assert!(edit_button_shown(true, None), "the neighbours are still loading");
+    }
+
+    #[test]
+    fn it_is_not_offered_on_videos_stickers_or_when_signed_out() {
+        assert!(!edit_button_shown(true, Some(&media("clip.mp4", "video/mp4", false))));
+        assert!(!edit_button_shown(true, Some(&media("s.webp", "image/webp", true))));
+        assert!(!edit_button_shown(false, Some(&media("photo.jpg", "image/jpeg", false))));
+        assert!(!edit_button_shown(false, None));
+    }
+}
+
+#[cfg(test)]
+mod panel_shortcut_tests {
+    use super::*;
+    #[gtk::test]
+    #[ignore = "requires a private GTK display, keyring and xdotool"]
+    fn media_keys_switch_and_toggle_from_the_composer() {
+        let app = adw::Application::builder().application_id("com.negzero.MediaKeysFixture")
+            .flags(gio::ApplicationFlags::NON_UNIQUE).build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let ui = Ui::new(&app, true);
+        ui.window.set_title(Some("Monogram media keys fixture"));
+        ui.window.present();ui.composer.grab_focus();
+        let pump = || { let until=Instant::now()+Duration::from_millis(220);while Instant::now()<until {for _ in 0..100 {if !glib::MainContext::default().pending(){break;}glib::MainContext::default().iteration(false);}std::thread::sleep(Duration::from_millis(2));}};
+        pump();
+        let result=std::process::Command::new("xdotool").args(["search","--name","^Monogram media keys fixture$"]).output().unwrap();
+        let id=String::from_utf8(result.stdout).unwrap().lines().last().unwrap().to_owned();
+        assert!(std::process::Command::new("xdotool").args(["windowfocus","--sync",&id]).status().unwrap().success());
+        for (key, tab, shown) in [("ctrl+e","emoji",true),("ctrl+s","stickers",true),("ctrl+g","gifs",true),("ctrl+g","gifs",false),("ctrl+e","emoji",true)] {
+            ui.composer.grab_focus();
+            assert!(std::process::Command::new("xdotool").args(["key","--clearmodifiers",key]).status().unwrap().success());pump();
+            assert_eq!(ui.media_tabs.active_name().as_deref(),Some(tab),"{key}");
+            assert_eq!(ui.media_stack.visible_child_name().as_deref(),Some(tab),"{key}");
+            assert_eq!(ui.utility.shows_sidebar(),shown,"{key}");
+        }
+        ui.window.close();
     }
 }

@@ -20,12 +20,17 @@ use std::{
 };
 pub struct Ui {
     pub avatars: RefCell<crate::avatar_ui::Avatars>,
+    pub contact_load_serial: Cell<u64>,
+    pub local_contacts: RefCell<HashMap<String, crate::contact_details::LocalContact>>,
+    pub local_contact_avatars: RefCell<HashMap<String, gtk::gdk::Texture>>,
     pub images: RefCell<crate::image_ui::Images>,
     pub uploads: RefCell<crate::upload_ui::Uploads>,
     pub downloads: RefCell<crate::downloads::Downloads>,
     pub window: adw::ApplicationWindow,
     pub toast: adw::ToastOverlay,
+    pub(crate) feedback: RefCell<crate::toast_routing::Feedback>,
     pub overlay: gtk::Overlay,
+    pub(crate) picker_zoom: Rc<crate::picker_zoom::PickerZoom>,
     pub(crate) send_animation: crate::send_animation::SendAnimation,
     shell: gtk::Stack,
     welcome_status: gtk::Label,
@@ -78,13 +83,18 @@ pub struct Ui {
     pub anchor: RefCell<Option<String>>,
     pub bubbles: RefCell<HashMap<String, gtk::Widget>>,
     pub(crate) rendered_rows: RefCell<crate::messages::RenderedRows>,
+    pub(crate) recent_timelines: RefCell<std::collections::VecDeque<crate::messages::CachedTimeline>>,
     pub(crate) reply_scroll: RefCell<Option<adw::TimedAnimation>>,
     chat_refresh_pending: Cell<bool>,
     pub media_stack: gtk::Stack,
     pub(crate) media_search: gtk::SearchEntry,
     pub media_pane: adw::ToolbarView,
     pub media_mode: RefCell<String>,
+    pub media_tabs: adw::ToggleGroup,
     pub media_toggles: RefCell<HashMap<String, adw::Toggle>>,
+    pub(crate) primary_menu: gtk::MenuButton,
+    /// Header bar shortcut to the room participants; shown for group chats only.
+    pub(crate) participants_button: gtk::Button,
     pub request_button: gtk::Button,
     pub request_badge: gtk::Label,
     pub session: RefCell<Option<Session>>,
@@ -96,8 +106,16 @@ pub struct Ui {
     pub pq_reviews: RefCell<HashMap<String, Vec<crate::crypto::pq::service::Review>>>,
     pub encryption_checks: RefCell<HashMap<String, String>>,
     pub encryption_revision: Cell<u64>,
+    /// Rooms where the user chose Send Anyway, and until when: messages to them skip members whose
+    /// keys cannot be used without asking again. In memory only, so it ends with the session.
+    pub(crate) send_anyway_until: RefCell<HashMap<String, std::time::Instant>>,
     pub room_syncing: RefCell<Option<(u64, String, u64)>>,
     pub room_sync_retry: RefCell<HashMap<String, (Instant, u8)>>,
+    pub(crate) active_audio: RefCell<Option<std::rc::Weak<crate::video_ui::Playback>>>,
+    pub(crate) active_profile: RefCell<Option<gtk::Popover>>,
+    pub(crate) profile_controls: RefCell<Option<crate::profile_ui::ProfileControls>>,
+    pub(crate) profile_cache: RefCell<HashMap<String,(Instant,crate::profiles::Profile)>>,
+    pub(crate) requests_revision: Cell<u64>,
     pub request_secrets: RefCell<crate::request_logic::SecretJobs>,
     pub security_widgets: RefCell<Option<crate::dialogs::SecurityControls>>,
     pub link_preview_jobs: RefCell<crate::link_preview_logic::Jobs>,
@@ -106,6 +124,15 @@ pub struct Ui {
     pub contact_access_widgets: RefCell<Option<crate::contact_access_ui::ContactAccessControls>>,
     pub blocking_snapshot: RefCell<crate::blocking::Snapshot>,
     pub blocking_loading: Cell<bool>,
+    pub(crate) last_activity: RefCell<crate::last_activity_ui::Cache>,
+    /// The open camera dialog, if any: only one at a time.
+    pub(crate) camera_dialog: RefCell<Option<glib::WeakRef<adw::Dialog>>>,
+    /// The microphone button and recording bar.
+    pub(crate) voice: RefCell<Option<Rc<crate::voice_ui::VoiceUi>>>,
+    /// The most reachable device's `show` and idle time for each contact who is online.
+    pub(crate) contact_status: RefCell<HashMap<String, crate::contact_status::Detail>>,
+    /// The status circle on the open conversation's avatar.
+    pub(crate) header_presence: RefCell<Option<crate::components::PresenceAvatar>>,
     pub blocking_error: RefCell<Option<String>>,
     pub blocking_list: RefCell<Option<crate::blocking_ui::ListControls>>,
     pub review_request: RefCell<Option<(String, crate::encryption_policy::Mode)>>,
@@ -115,19 +142,30 @@ pub struct Ui {
     pub loading: Cell<bool>,
     pub draft_timer: RefCell<Option<glib::SourceId>>,
     pub big_emoji: Cell<bool>,
-    pub typing: RefCell<HashMap<String, Instant>>,
+    pub auto_download_enabled: Cell<bool>,
+    pub auto_download_limit: Cell<u64>,
+    pub typing: RefCell<HashMap<(String, String), Instant>>,
+    pub(crate) header_subtitle: RefCell<Option<gtk::Label>>,
     pub last_typing: Cell<Option<Instant>>,
     pub typing_input: RefCell<Option<(String, Instant, bool)>>,
     pub history_pages: RefCell<HashMap<String, (String, bool)>>,
     pub history_pending: RefCell<HashSet<String>>,
+    /// Latest occupant list per joined room, and the open participants panel, if any.
+    pub room_rosters: RefCell<HashMap<String, Vec<crate::rooms::members::Participant>>>,
+    pub participants: RefCell<Option<Rc<crate::room_members_ui::ParticipantsView>>>,
+    /// The open participants pane was shown automatically (so it may also hide automatically).
+    pub participants_auto: Cell<bool>,
+    /// Cached "open participants by itself on wide windows" choice; None until first read.
+    pub participants_pref: Cell<Option<bool>>,
     pub cards: RefCell<Vec<Rc<crate::wallet::WalletCard>>>,
     pub dialogs: RefCell<Vec<adw::Dialog>>,
     pub smoke: bool,
     pub folder_serial: Cell<u32>,
     pub active_media: RefCell<Option<Rc<crate::media::MediaViewer>>>,
     pub active_story: RefCell<Option<Rc<crate::media::StoryViewer>>>,
-    pub sidebar_card: RefCell<Option<Rc<crate::wallet::WalletCard>>>,
+    pub sidebar_cards: RefCell<Vec<Rc<crate::wallet::WalletCard>>>,
     pub(crate) pack_library: RefCell<Option<crate::packs::Library>>,
+    pub(crate) pending_pack_files: RefCell<Vec<gio::File>>,
     pub(crate) pack_pages: RefCell<Vec<Rc<crate::media_library_ui::PackLibraryPage>>>,
     pub(crate) gif_library: RefCell<Option<crate::gifs::Library>>,
     pub(crate) gif_page: RefCell<Option<Rc<crate::media_library_ui::GifLibraryPage>>>,
@@ -181,13 +219,13 @@ impl Ui {
         let send_animation=crate::send_animation::SendAnimation::new();
         overlay.add_overlay(&send_animation);
         overlay.set_measure_overlay(&send_animation,false);
+        let picker_zoom=crate::picker_zoom::PickerZoom::new();overlay.add_overlay(&picker_zoom.root);overlay.set_measure_overlay(&picker_zoom.root,false);
         let shell = gtk::Stack::new();
         shell.set_hhomogeneous(false);
         shell.set_vhomogeneous(false);
         shell.add_named(&overlay, Some("main"));
         toast.set_child(Some(&shell));
-        let welcome_view = adw::ToolbarView::new();
-        welcome_view.add_top_bar(&adw::HeaderBar::new());
+        let welcome_view = crate::components::titled_page();
         let welcome_sign_in = gtk::Button::with_label("Sign In");
         welcome_sign_in.add_css_class("suggested-action");
         let welcome_sync=gtk::Button::with_label("Sync from Another Device");
@@ -243,15 +281,7 @@ impl Ui {
         bp.add_setter(&utility, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(bp);
         let (tx, rx) = mpsc::channel();
-        let composer = gtk::TextView::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .accepts_tab(false)
-            .hexpand(true)
-            .top_margin(6)
-            .bottom_margin(6)
-            .left_margin(4)
-            .right_margin(4)
-            .build();
+        let composer = crate::composer_view::ComposerView::new();
         let composer_inline = crate::inline_emoji_ui::ComposerInlineEmoji::new(&composer.buffer());
         let request_button = icon_button("contact-new-symbolic", "Requests and invitations");
         request_button.set_visible(false);
@@ -259,13 +289,18 @@ impl Ui {
         request_badge.set_visible(false);
         let ui = Rc::new(Self {
             avatars: RefCell::new(Default::default()),
+            contact_load_serial: Cell::new(0),
+            local_contacts: RefCell::new(HashMap::new()),
+            local_contact_avatars: RefCell::new(HashMap::new()),
             images: RefCell::new(Default::default()),
             uploads: RefCell::new(Default::default()),
             downloads: RefCell::new(Default::default()),
             window,
             toast,
+            feedback: RefCell::new(crate::toast_routing::Feedback::default()),
             overlay,
             send_animation,
+            picker_zoom,
             shell,
             welcome_status,
             welcome_progress,
@@ -288,6 +323,7 @@ impl Ui {
             store,
             folder_bar: FolderBar::new(),
             chat_stack: gtk::Stack::builder()
+                .vexpand(true)
                 .transition_duration(220)
                 .vhomogeneous(false)
                 .hhomogeneous(true)
@@ -357,9 +393,8 @@ impl Ui {
                 .build(),
             send_button: icon_button("mail-send-symbolic", "Send"),
             input_scroll: gtk::ScrolledWindow::builder()
-                .min_content_height(32)
-                .max_content_height(108)
-                .propagate_natural_height(false)
+                .min_content_height(0)
+                .propagate_natural_height(true)
                 .hexpand(true)
                 .build(),
             reply_bar: gtk::Revealer::new(),
@@ -373,6 +408,7 @@ impl Ui {
             anchor: RefCell::new(None),
             bubbles: RefCell::new(HashMap::new()),
             rendered_rows: RefCell::new(Default::default()),
+            recent_timelines: RefCell::new(Default::default()),
             reply_scroll: RefCell::new(None),
             chat_refresh_pending: Cell::new(false),
             media_stack: gtk::Stack::builder()
@@ -387,7 +423,16 @@ impl Ui {
                 .build(),
             media_pane: adw::ToolbarView::new(),
             media_mode: RefCell::new("media".into()),
+            media_tabs: adw::ToggleGroup::builder().homogeneous(false).can_shrink(false).build(),
             media_toggles: RefCell::new(HashMap::new()),
+            primary_menu: gtk::MenuButton::builder().icon_name("open-menu-symbolic").build(),
+            participants_button: {
+                let button = icon_button("system-users-symbolic", "Participants");
+                button.set_action_name(Some("win.participants"));
+                button.set_visible(false);
+                button.update_property(&[gtk::accessible::Property::Label("Participants")]);
+                button
+            },
             request_button,
             request_badge,
             session: RefCell::new(None),
@@ -399,13 +444,24 @@ impl Ui {
             pq_reviews: RefCell::new(HashMap::new()),
             encryption_checks: RefCell::new(HashMap::new()),
             encryption_revision: Cell::new(0),
+            send_anyway_until: RefCell::new(HashMap::new()),
             room_syncing: RefCell::new(None),
             room_sync_retry: RefCell::new(HashMap::new()),
+            active_audio: RefCell::new(None),
+            active_profile: RefCell::new(None),
+            profile_controls: RefCell::new(None),
+            profile_cache: RefCell::new(HashMap::new()),
+            requests_revision: Cell::new(0),
             request_secrets: RefCell::new(Default::default()),
             security_widgets: RefCell::new(None),
             contact_access_widgets: RefCell::new(None),
             blocking_snapshot: RefCell::new(Default::default()),
             blocking_loading: Cell::new(false),
+            last_activity: RefCell::new(Default::default()),
+            camera_dialog: RefCell::new(None),
+            voice: RefCell::new(None),
+            contact_status: RefCell::new(HashMap::new()),
+            header_presence: RefCell::new(None),
             blocking_error: RefCell::new(None),
             blocking_list: RefCell::new(None),
             link_preview_jobs: RefCell::new(Default::default()),
@@ -418,20 +474,28 @@ impl Ui {
             loading: Cell::new(false),
             draft_timer: RefCell::new(None),
             big_emoji: Cell::new(true),
+            auto_download_enabled: Cell::new(true),
+            auto_download_limit: Cell::new(crate::downloads::DEFAULT_AUTO_MAX),
             typing: RefCell::new(HashMap::new()),
+            header_subtitle: RefCell::new(None),
             last_typing: Cell::new(None),
             typing_input: RefCell::new(None),
             history_pages: RefCell::new(HashMap::new()),
             history_pending: RefCell::new(HashSet::new()),
+            room_rosters: RefCell::new(HashMap::new()),
+            participants: RefCell::new(None),
+            participants_auto: Cell::new(false),
+            participants_pref: Cell::new(None),
             cards: RefCell::new(vec![]),
             dialogs: RefCell::new(vec![]),
             smoke,
             folder_serial: Cell::new(0),
             active_media: RefCell::new(None),
             active_story: RefCell::new(None),
-            sidebar_card: RefCell::new(None),
+            sidebar_cards: RefCell::new(Vec::new()),
             pack_library: RefCell::new(None),
             pack_pages: RefCell::new(Vec::new()),
+            pending_pack_files: RefCell::new(Vec::new()),
             gif_library: RefCell::new(None),
             gif_page: RefCell::new(None),
             favorite_orders: RefCell::new(HashMap::new()),
@@ -470,6 +534,8 @@ impl Ui {
                 ui.mark_visible_chat_read();
             }
         });
+        ui.auto_download_enabled.set(ui.store.pref("auto_download_files","true")=="true");
+        ui.auto_download_limit.set(ui.store.pref("auto_download_limit_mb","15").parse::<u64>().ok().filter(|n|(1..=4000).contains(n)).unwrap_or(15)*1024*1024);
         ui.big_emoji
             .set(ui.store.pref("big_emoji", "true") == "true");
         crate::emoji_completion::set_discord_style(
@@ -503,7 +569,7 @@ impl Ui {
                 let kind = std::mem::discriminant(&e);
                 let started = Instant::now();
                 ui.backend_event(g, &a, e);
-                if started.elapsed() >= Duration::from_millis(50) {
+                if started.elapsed() >= Duration::from_millis(250) {
                     eprintln!(
                         "Monogram slow backend event {kind:?}: {} ms",
                         started.elapsed().as_millis()
@@ -513,6 +579,24 @@ impl Ui {
             ui.poll_uploads();
             glib::ControlFlow::Continue
         });
+        if !smoke {
+            // Telegram packs are checked after startup and then every half hour; each pack
+            // is only re-imported once its own six-hour interval has passed.
+            let updates = Rc::downgrade(&ui);
+            glib::timeout_add_seconds_local(30 * 60, move || {
+                let Some(ui) = updates.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                ui.update_due_packs();
+                glib::ControlFlow::Continue
+            });
+            let first = Rc::downgrade(&ui);
+            glib::timeout_add_seconds_local_once(90, move || {
+                if let Some(ui) = first.upgrade() {
+                    ui.update_due_packs();
+                }
+            });
+        }
         let weak = Rc::downgrade(&ui);
         let typing_ui = Rc::downgrade(&ui);
         glib::timeout_add_local(Duration::from_secs(1), move || {
@@ -529,11 +613,11 @@ impl Ui {
             ui.retry_request_cleanup();
             ui.typing
                 .borrow_mut()
-                .retain(|_, t| t.elapsed() < Duration::from_secs(10));
+                .retain(|_, t| t.elapsed() < crate::chat_states::TIMEOUT);
             if before != ui.typing.borrow().len()
                 && ui.pages.visible_child_name().as_deref() == Some("chat")
             {
-                ui.show_chat();
+                ui.update_chat_subtitle();
             }
             glib::ControlFlow::Continue
         });
@@ -597,6 +681,7 @@ impl Ui {
                 || focus_is_editable
                 || ui.pages.visible_child_name().as_deref() != Some("chat")
                 || ui.active_media.borrow().is_some()
+                || ui.active_story.borrow().is_some()
                 || ui.window.visible_dialog().is_some()
             {
                 return glib::Propagation::Proceed;
@@ -610,6 +695,7 @@ impl Ui {
         });
         ui.window.add_controller(typing_keys);
         ui.install_formatting();
+        ui.picker_zoom.install(&ui);
         ui.window.connect_close_request(move |_| {
             if let Some(u) = weak.upgrade() {
                 u.save_draft();
@@ -638,10 +724,150 @@ impl Ui {
             }
         });
     }
-    pub fn notice(&self, message: &str) {
-        self.toast.add_toast(adw::Toast::new(message));
+    /// Earlier versions pinned a room to Legacy OMEMO for a day when the user chose Send Anyway, and
+    /// Legacy OMEMO refuses reactions. Forget those cached choices once; the next send simply asks
+    /// again, and automatic selection picks the protocol as usual.
+    fn clear_legacy_room_pins(&self, state: &mut State) {
+        let key = format!("legacy_room_pins_cleared:{}", state.account);
+        if state.account.is_empty() || self.store.pref(&key, "false") == "true" {
+            return;
+        }
+        for chat in state.chats.iter_mut().filter(|chat| chat.group) {
+            if chat
+                .automatic_encryption
+                .is_some_and(|selection| selection.mode == crate::encryption_policy::Mode::Legacy)
+            {
+                chat.automatic_encryption = None;
+            }
+        }
+        let _ = self.store.set_pref(&key, "true");
     }
-    fn queue_chat_refresh(self: &Rc<Self>) {
+    /// The toast for a message that did not go out. In a group chat, when the cause is one member's
+    /// keys that cannot be used, it offers Send Anyway: the same message, still encrypted, for
+    /// everyone who can be reached. Otherwise it is [`Self::notice_resolving_authorization`].
+    pub(crate) fn notice_send_failure(
+        self: &Rc<Self>,
+        peer: &str,
+        ids: Vec<String>,
+        reason: &str,
+        title: String,
+    ) {
+        let in_group = self
+            .state
+            .borrow()
+            .chats
+            .iter()
+            .any(|chat| chat.jid == peer && chat.group);
+        if in_group {
+            if let Some(fix) = crate::rooms::fix_for(reason) {
+                let toast = adw::Toast::builder().title(title).button_label("Resolve").build();
+                let weak = Rc::downgrade(self);
+                let peer = peer.to_owned();
+                toast.connect_button_clicked(move |_| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.resolve_room_failure(&peer, fix);
+                    }
+                });
+                return self.show_toast(toast);
+            }
+        }
+        if !in_group
+            || ids.is_empty()
+            || !self.offers_send_anyway()
+            || !crate::crypto::skippable_reason(reason)
+        {
+            return self.notice_resolving_authorization(reason, title);
+        }
+        let toast = adw::Toast::builder()
+            .title(title)
+            .button_label("Send Anyway")
+            .build();
+        let weak = Rc::downgrade(self);
+        let peer = peer.to_owned();
+        toast.connect_button_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.send_anyway(&peer, &ids);
+            }
+        });
+        self.show_toast(toast);
+    }
+    /// The toast for a room whose automatic encryption ended at plaintext. In a group with messages
+    /// to resend it offers Send Anyway; otherwise it explains how to send unencrypted.
+    pub(crate) fn notice_downgrade_blocked(self: &Rc<Self>, peer: &str, ids: Vec<String>) {
+        let in_group = self
+            .state
+            .borrow()
+            .chats
+            .iter()
+            .any(|chat| chat.jid == peer && chat.group);
+        if !in_group || ids.is_empty() || !self.offers_send_anyway() {
+            return self.notice(crate::send_policy_ui::DOWNGRADE_NOTICE);
+        }
+        let toast = adw::Toast::builder()
+            .title(crate::send_policy_ui::DOWNGRADE_TOAST)
+            .button_label("Send Anyway")
+            .build();
+        let weak = Rc::downgrade(self);
+        let peer = peer.to_owned();
+        toast.connect_button_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.send_anyway(&peer, &ids);
+            }
+        });
+        self.show_toast(toast);
+    }
+    /// Open what deals with a room that cannot be encrypted: Conversation Security to choose how it
+    /// is sent, or the participants to see who is in it. The room is shown first if it is not open.
+    pub(crate) fn resolve_room_failure(self: &Rc<Self>, room: &str, fix: crate::rooms::Fix) {
+        let id = self
+            .state
+            .borrow()
+            .chats
+            .iter()
+            .find(|chat| chat.jid == room && chat.group)
+            .map(|chat| chat.id.clone());
+        let Some(id) = id else { return };
+        if self.state.borrow().current().jid != room {
+            self.select_chat(&id);
+        }
+        match fix {
+            crate::rooms::Fix::Security => self.security(),
+            crate::rooms::Fix::Participants => self.show_participants(),
+        }
+    }
+    /// A toast for `title`. When `reason` is a Legacy OMEMO contact-authorization refusal, it names
+    /// the contact who refused and carries a Resolve button that opens Control Access for them
+    /// (in a room too, where the contact is a member and `peer` is the room).
+    pub(crate) fn notice_resolving_authorization(self: &Rc<Self>, reason: &str, title: String) {
+        let owner = self.state.borrow().account.clone();
+        let Some(contact) = crate::crypto::legacy::denied_contact(reason)
+            .filter(|contact| crate::contact_access::valid_peer(&owner, contact))
+            .map(str::to_owned)
+        else {
+            return self.notice(&title);
+        };
+        let toast = adw::Toast::builder()
+            .title(title)
+            .button_label("Resolve")
+            .build();
+        let weak = Rc::downgrade(self);
+        toast.connect_button_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.contact_access(&contact);
+            }
+        });
+        self.show_toast(toast);
+    }
+    pub fn notice(&self, message: &str) {
+        self.show_toast(adw::Toast::new(message));
+    }
+    /// Show a toast where it is visible: above any open dialog rather than behind it.
+    pub fn show_toast(&self, toast: adw::Toast) {
+        let Some(dismissed)=self.feedback.borrow_mut().admit(toast.title().as_deref().unwrap_or_default(), toast.button_label().as_deref()) else {return};
+        toast.connect_dismissed(move |_|dismissed.set(true));
+        crate::toast_routing::show(&self.window, &self.toast, toast);
+    }
+    pub(crate) fn queue_chat_refresh(self: &Rc<Self>) {
         if self.chat_refresh_pending.replace(true) {
             return;
         }
@@ -676,12 +902,16 @@ impl Ui {
         self.window.add_action(&action);
     }
     fn actions(self: &Rc<Self>) {
-        self.install_reply_scroll_input();
+        crate::chat_navigation::install(self);
+        self.install_message_scroll_input();
         crate::lan_sync_ui::install(self);
         self.action("search", |s| {
             s.search_toggle.set_active(!s.search_toggle.is_active())
         });
         self.action("media", |s| s.toggle_media());
+        self.action("emoji-panel", |s| s.toggle_media_tab("emoji"));
+        self.action("sticker-panel", |s| s.toggle_media_tab("stickers"));
+        self.action("gif-panel", |s| s.toggle_media_tab("gifs"));
         self.action("shared-media", |s| s.shared_media());
         self.action("new-chat", |s| s.new_chat());
         self.action("accounts", |s| s.accounts_dialog());
@@ -691,6 +921,7 @@ impl Ui {
         self.action("shortcuts", |s| s.shortcuts());
         self.action("security", |s| s.security());
         self.action("info", |s| s.show_info());
+        self.action("participants", |s| s.show_participants());
         self.action("blocked-contacts", |s| s.blocked_contacts());
         self.action("requests", |s| s.requests());
         self.action("sync-history", |s| {
@@ -709,14 +940,15 @@ impl Ui {
             s.preview_form("Spaces and Channels", &["Service", "Channel name"])
         });
         self.action("profile", |s| {
-            s.preview_form("Your Profile", &["Display name", "About", "Website"])
-        });
-        self.action("developer", |s| {
-            s.preview_form("Developer Tools", &["Service address", "Command"])
+            let owner=s.state.borrow().account.clone();
+            if owner.is_empty(){s.notice("Sign in to view your profile.");}else{
+                let weak=Rc::downgrade(s);glib::idle_add_local_once(move||{if let Some(ui)=weak.upgrade().filter(|ui|ui.state.borrow().account==owner){ui.profile_card(&ui.primary_menu,&owner,&owner);}});
+            }
         });
         self.action("call", |s| s.call_preview());
         self.action("attach-file", |s| s.choose_files(false));
         self.action("attach-media", |s| s.choose_files(true));
+        self.action("attach-camera", |s| s.open_camera());
         self.action("poll", |s| s.new_poll());
         self.action("article", |s| s.article());
         self.action("location", |s| {
@@ -744,6 +976,9 @@ impl Ui {
             for (name, keys) in [
                 ("search", vec!["<Control>f"]),
                 ("media", vec!["F9"]),
+                ("emoji-panel", vec!["<Control>e"]),
+                ("sticker-panel", vec!["<Control>s"]),
+                ("gif-panel", vec!["<Control>g"]),
                 ("new-chat", vec!["<Control>n"]),
                 ("attach-file", vec!["<Control>o"]),
                 ("preferences", vec!["<Control>comma"]),
@@ -780,15 +1015,12 @@ impl Ui {
             ("Preferences", "preferences"),
             ("Keyboard Shortcuts", "shortcuts"),
             ("About Monogram", "about"),
-            ("Developer Tools", "developer"),
         ] {
             section.append(Some(title), Some(&format!("win.{action}")))
         }
         menu.append_section(None, &section);
-        let primary = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
-            .menu_model(&menu)
-            .build();
+        let primary = self.primary_menu.clone();
+        primary.set_menu_model(Some(&menu));
         header.pack_end(&primary);
         let icon = gtk::Overlay::builder()
             .child(&gtk::Image::from_icon_name("contact-new-symbolic"))
@@ -940,22 +1172,30 @@ impl Ui {
         }
     }
     pub fn set_folder(self: &Rc<Self>, name: &str) {
-        let (old, new) = {
-            let mut s = self.state.borrow_mut();
-            let old = s
-                .folder_order
-                .iter()
-                .position(|n| n == &s.folder)
-                .unwrap_or(0);
-            let new = s.folder_order.iter().position(|n| n == name).unwrap_or(0);
-            if s.folder == name {
-                return;
+        let changed = {
+            let mut state=self.state.borrow_mut();
+            if state.folder==name {None} else {
+                let old=state.folder_order.iter().position(|n|n==&state.folder).unwrap_or(0);
+                let new=state.folder_order.iter().position(|n|n==name).unwrap_or(0);
+                state.folder=name.into();Some(new>=old)
             }
-            s.folder = name.into();
-            (old, new)
         };
-        self.refresh_chats(Some(new >= old));
-        self.persist();
+        let mut child=self.folder_bar.first_child();
+        while let Some(widget)=child {
+            child=widget.next_sibling();
+            if let Some(button)=widget.downcast_ref::<gtk::ToggleButton>().filter(|button|button.widget_name()==name) {
+                button.set_active(true);
+                if let Some(scroll)=self.folder_bar.ancestor(gtk::ScrolledWindow::static_type()).and_downcast::<gtk::ScrolledWindow>() {
+                    if let Some(bounds)=button.compute_bounds(&self.folder_bar) {
+                        let adjustment=scroll.hadjustment();let start=f64::from(bounds.x());let end=start+f64::from(bounds.width());
+                        if start<adjustment.value(){adjustment.set_value(start);}
+                        else if end>adjustment.value()+adjustment.page_size(){adjustment.set_value(end-adjustment.page_size());}
+                    }
+                }
+                break;
+            }
+        }
+        if let Some(direction)=changed {self.refresh_chats(Some(direction));self.persist();}
     }
     pub fn refresh_chats(self: &Rc<Self>, direction: Option<bool>) {
         let list = gtk::ListBox::new();
@@ -974,56 +1214,30 @@ impl Ui {
         let state = self.state.borrow();
         for chat in state.filtered(self.search.text().as_str()) {
             let latest = chat.latest_preview();
-            let row = gtk::ListBoxRow::new();
-            row.set_widget_name(&chat.id);
-            let line = bx(false, 11);
-            line.append(&self.chat_avatar(&chat, 44));
-            let words = bx(true, 5);
-            words.set_hexpand(true);
-            let top = bx(false, 8);
-            let name = text(&chat.name, "chat-name");
-            name.set_hexpand(true);
-            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            top.append(&name);
-            top.append(&label(
-                latest.as_ref().map(|m| m.time.as_str()).unwrap_or("Now"),
-                "chat-time",
-            ));
-            words.append(&top);
-            let bottom = bx(false, 6);
+            let avatar = self.chat_avatar(&chat, 44);
+            let leading: gtk::Widget = if chat.group {
+                avatar.upcast()
+            } else {
+                let dot = crate::components::PresenceAvatar::new(&avatar);
+                dot.set_presence(self.contact_presence(&chat));
+                dot.set_dot_visible(self.shows_contact_status());
+                self.profile_button(&dot, &chat.jid, chat.display_name()).upcast()
+            };
+            let row = crate::components::ChatRow::new(&chat.id, &leading);
+            row.set_title(chat.display_name());
+            row.set_time(latest.as_ref().map(|m| m.time.as_str()).unwrap_or("Now"));
             let preview = if !chat.draft.is_empty() {
                 format!("Draft: {}", chat.draft.replace('\n', " "))
             } else {
                 latest
                     .as_ref()
-                    .map(|m| {
-                        format!(
-                            "{}{}",
-                            if m.own { "You: " } else { "" },
-                            m.text.replace('\n', " ")
-                        )
-                    })
+                    .map(|m| format!("{}{}", if m.own { "You: " } else { "" }, m.text.replace('\n', " ")))
                     .unwrap_or_else(|| "No messages yet".into())
             };
-            let l = text(&preview, "chat-preview");
-            l.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            l.set_hexpand(true);
-            bottom.append(&l);
-            if chat.unread > 0 || chat.unread_mark {
-                bottom.append(&label(
-                    &if chat.unread > 0 {
-                        chat.unread.to_string()
-                    } else {
-                        "•".into()
-                    },
-                    "unread-badge",
-                ))
-            } else if chat.pinned {
-                bottom.append(&gtk::Image::from_icon_name("view-pin-symbolic"))
-            }
-            words.append(&bottom);
-            line.append(&words);
-            row.set_child(Some(&line));
+            row.set_preview(preview.as_str());
+            row.set_unread(chat.unread);
+            row.set_unread_mark(chat.unread_mark);
+            row.set_pinned(chat.pinned);
             let actions = vec![
                 ("Open".into(), format!("chat-open:{}", chat.id)),
                 (
@@ -1071,6 +1285,15 @@ impl Ui {
                 ui.select_chat(row.widget_name().as_str())
             }
         });
+        let page:gtk::Widget=if list.first_child().is_none() {
+            let searching=!self.search.text().trim().is_empty();
+            let empty=adw::StatusPage::builder()
+                .icon_name(if searching {"system-search-symbolic"}else{"folder-symbolic"})
+                .title(if searching {"No Results"}else{"No Conversations"})
+                .description(if searching {"Try a different search."}else{"Conversations in this folder will appear here."})
+                .vexpand(true).build();
+            empty.add_css_class("compact");empty.upcast()
+        }else{list.upcast()};
         let serial = self.folder_serial.get() + 1;
         self.folder_serial.set(serial);
         self.chat_stack.set_transition_type(match direction {
@@ -1079,13 +1302,13 @@ impl Ui {
             None => gtk::StackTransitionType::None,
         });
         self.chat_stack
-            .add_named(&list, Some(&format!("list-{serial}")));
-        self.chat_stack.set_visible_child(&list);
+            .add_named(&page, Some(&format!("list-{serial}")));
+        self.chat_stack.set_visible_child(&page);
         if !self.chat_stack.is_transition_running() {
             let pages = self.chat_stack.pages();
             for i in (0..pages.n_items()).rev() {
                 if let Some(page) = pages.item(i).and_downcast::<gtk::StackPage>() {
-                    if page.child() != list {
+                    if Some(page.child()) != self.chat_stack.visible_child() {
                         self.chat_stack.remove(&page.child());
                     }
                 }
@@ -1114,9 +1337,16 @@ impl Ui {
                 b.set_visible(s.is_collapsed())
             }
         });
+        // The utility pane is pinned from 1240sp up: show the participants there by itself.
+        let weak = Rc::downgrade(self);
+        self.utility.connect_collapsed_notify(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.sync_participants();
+            }
+        });
         self.title.add_css_class("flat");
         self.title.add_css_class("conversation-title");
-        self.weak_button(&self.title, |s| s.show_info());
+        self.weak_button(&self.title, |s| {let chat=s.state.borrow().current().clone();if chat.group{s.show_info();}else{s.profile_card(&s.title,&chat.jid,chat.display_name());}});
         header.pack_start(&self.title);
         self.titles.add_named(&self.section_title, Some("normal"));
         self.titles.add_named(&self.search, Some("search"));
@@ -1126,6 +1356,7 @@ impl Ui {
         for (t, a) in [
             ("Conversation Security", "security"),
             ("Conversation Info", "info"),
+            ("Participants", "participants"),
         ] {
             menu.append(Some(t), Some(&format!("win.{a}")))
         }
@@ -1156,6 +1387,7 @@ impl Ui {
                 .menu_model(&menu)
                 .build(),
         );
+        header.pack_end(&self.participants_button);
         view.add_top_bar(&header);
         let chat = bx(true, 0);
         chat.add_css_class("conversation");
@@ -1163,7 +1395,7 @@ impl Ui {
         self.timeline.add_css_class("message-list");
         let timeline_clamp = adw::Clamp::builder()
             .child(&self.timeline)
-            .maximum_size(1080)
+            .maximum_size(TIMELINE_MAX_WIDTH)
             .tightening_threshold(840)
             .build();
         timeline_clamp.add_css_class("timeline-clamp");
@@ -1291,6 +1523,7 @@ impl Ui {
         let menu = gio::Menu::new();
         for (t, a) in [
             ("Photo or Video…", "attach-media"),
+            ("Take Photo…", "attach-camera"),
             ("File…", "attach-file"),
             ("Poll…", "poll"),
             ("Payment…", "payment"),
@@ -1304,12 +1537,6 @@ impl Ui {
         self.input_scroll.set_child(Some(&self.composer));
         self.input_scroll
             .set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        let weak = Rc::downgrade(self);
-        self.input_scroll.vadjustment().connect_changed(move |_| {
-            if let Some(s) = weak.upgrade() {
-                s.queue_composer_height();
-            }
-        });
         let input = gtk::Overlay::builder()
             .child(&self.input_scroll)
             .hexpand(true)
@@ -1319,6 +1546,17 @@ impl Ui {
         let emoji = icon_button("face-smile-symbolic", "Emoji, stickers and GIFs · F9");
         self.weak_button(&emoji, |s| s.toggle_media());
         composer_row.append(&emoji);
+        // The microphone button sits right after the emoji button, in the same style; while
+        // recording, the rest of the box makes way for the recording bar.
+        let voice = crate::voice_ui::install(
+            self,
+            &composer_row,
+            crate::voice_ui::Parts {
+                hide: vec![attach.clone().upcast(), input.clone().upcast(), emoji.clone().upcast(), attachments.clone().upcast(), self.send_button.clone().upcast()],
+                after: input.clone().upcast(),
+            },
+        );
+        self.voice.replace(Some(voice));
         composer.append(&composer_row);
         line.append(&composer);
         self.send_button.remove_css_class("flat");
@@ -1336,6 +1574,7 @@ impl Ui {
         chat.set_vexpand(true);
         conversation.append(&chat);
         conversation.append(&shell);
+        crate::drop_files::install(self, &conversation);
         self.pages.add_named(&conversation, Some("chat"));
         self.pages
             .add_named(&scroll(&self.search_page), Some("search"));
@@ -1347,7 +1586,7 @@ impl Ui {
                 s.compose_changed()
             }
         });
-        let emoji_completion = crate::emoji_completion::attach(&self.composer);
+        let emoji_completion = crate::emoji_completion::attach_for_chat(&self.composer, self);
         crate::clipboard_upload::attach(self);
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1359,6 +1598,10 @@ impl Ui {
             let Some(s) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            if key==gdk::Key::Up && state.is_empty() && s.composer_text().is_empty() {
+                let id=s.state.borrow().current().messages.iter().rev().find(|m|m.own&&!m.retracted&&!m.unavailable&&!m.text.is_empty()).map(|m|m.id.clone());
+                if let Some(id)=id{s.edit_message(&id);return glib::Propagation::Stop;}
+            }
             if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
                 && !state.contains(gdk::ModifierType::SHIFT_MASK)
             {
@@ -1379,58 +1622,10 @@ impl Ui {
         let b = self.composer.buffer();
         b.text(&b.start_iter(), &b.end_iter(), true).into()
     }
-    fn queue_composer_height(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        glib::idle_add_local_once(move || {
-            if let Some(s) = weak.upgrade() {
-                s.sync_composer_height();
-                let weak = Rc::downgrade(&s);
-                // GTK scrolls the insertion mark after layout; settle on the next frame.
-                s.input_scroll.add_tick_callback(move |_, _| {
-                    if let Some(s) = weak.upgrade() {
-                        s.sync_composer_height();
-                    }
-                    glib::ControlFlow::Break
-                });
-            }
-        });
-    }
-    fn sync_composer_height(&self) {
-        let end = self.composer.buffer().end_iter();
-        let last_line = self.composer.iter_location(&end);
-        let content_height = last_line
-            .y()
-            .saturating_add(last_line.height())
-            .saturating_add(self.composer.top_margin())
-            .saturating_add(self.composer.bottom_margin());
-        let viewport_height = content_height.clamp(32, 108);
-        if self.input_scroll.min_content_height() != viewport_height {
-            self.input_scroll.set_min_content_height(viewport_height);
-        }
-        let policy = if content_height > 108 {
-            gtk::PolicyType::Automatic
-        } else {
-            gtk::PolicyType::Never
-        };
-        if self.input_scroll.vscrollbar_policy() != policy {
-            self.input_scroll.set_vscrollbar_policy(policy);
-        }
-        if content_height <= 108 {
-            // Compact composers show every line; only capped composers follow the caret.
-            let adjustment = self.input_scroll.vadjustment();
-            if adjustment.value() != adjustment.lower() {
-                adjustment.set_value(adjustment.lower());
-            }
-            let mut start = self.composer.buffer().start_iter();
-            self.composer
-                .scroll_to_iter(&mut start, 0.0, true, 0.0, 0.0);
-        }
-    }
     pub fn compose_changed(self: &Rc<Self>) {
         let composer_text = self.composer_text();
         self.composer_placeholder
             .set_visible(composer_text.is_empty());
-        self.queue_composer_height();
         self.update_send_button();
         if self.loading.get() {
             return;
@@ -1488,12 +1683,19 @@ impl Ui {
             .shows_sidebar()
             .then(|| {
                 let mode = self.media_mode.borrow();
-                matches!(mode.as_str(), "info" | "shared-media").then(|| mode.clone())
+                matches!(mode.as_str(), "info" | "shared-media" | "participants")
+                    .then(|| mode.clone())
             })
             .flatten();
         self.save_draft();
         let switched = self.state.borrow().active != id;
+        if switched {
+            // A recording belongs to the conversation it was made in.
+            self.voice_cancel();
+        }
+        let newest = self.history_window.newest();
         self.timeline_scope_changed();
+        if switched { self.switch_cached_timeline(id, newest); }
         {
             let mut state = self.state.borrow_mut();
             if switched && !state.account.is_empty() {
@@ -1508,33 +1710,60 @@ impl Ui {
         clear(&self.chips);
         self.chips.set_visible(false);
         self.load_current();
+        let local_avatar=self.local_contacts.borrow().get(&self.state.borrow().current().jid).is_some_and(|contact|contact.avatar.is_some());
+        if local_avatar && !self.local_contact_avatars.borrow().contains_key(&self.state.borrow().current().jid) { self.reload_contact_details(); }
         if switched {
             match visible_sidebar.as_deref() {
                 Some("info") => self.show_info(),
                 Some("shared-media") => self.shared_media(),
+                Some("participants") => {
+                    let auto = self.participants_auto.get();
+                    if self.state.borrow().current().group {
+                        self.open_participants(auto)
+                    } else if auto {
+                        // Shown automatically for a room; a non-room chat has nothing to list.
+                        self.participants_auto.set(false);
+                        self.utility.set_show_sidebar(false);
+                    } else {
+                        self.show_info()
+                    }
+                }
                 _ => {}
             }
         }
         if !self.state.borrow().account.is_empty() {
             self.load_timeline(None);
         }
+        self.refresh_last_activity_current();
         self.refresh_chats(None);
         self.persist();
         if self.split.is_collapsed() {
             self.split.set_show_sidebar(false)
         }
-        if self.online.get() {
-            let state = self.state.borrow();
-            let chat = state.current();
-            if chat.group && !chat.room_joined {
-                self.command(Command::JoinRoom {
-                    peer: chat.jid.clone(),
-                    nick: None,
-                });
-            } else {
-                drop(state);
-                self.load_history(true)
+        self.sync_participants();
+        self.resume_current_chat();
+    }
+    fn resume_current_chat(self: &Rc<Self>) {
+        if !self.online.get() {
+            return;
+        }
+        let state = self.state.borrow();
+        let chat = state.current();
+        if chat.group && !chat.room_joined {
+            let request = Command::JoinRoom {
+                peer: chat.jid.clone(),
+                nick: chat.room_nick.clone(),
+            };
+            drop(state);
+            if self.command(request) {
+                self.state.borrow_mut().current_mut().subtitle = "Joining…".into();
+                if self.pages.visible_child_name().as_deref() == Some("chat") {
+                    self.show_chat();
+                }
             }
+        } else {
+            drop(state);
+            self.load_history(true);
         }
     }
     pub fn load_current(self: &Rc<Self>) {
@@ -1557,25 +1786,27 @@ impl Ui {
         self.section_title.set_text("");
         let state = self.state.borrow();
         let chat = state.current();
+        self.participants_button.set_visible(chat.group);
         self.composer_placeholder
-            .set_text(&format!("Message {}…", chat.name));
+            .set_text(&format!("Message {}…", chat.display_name()));
         self.composer_placeholder
             .set_visible(self.composer_text().is_empty());
         let title = bx(false, 8);
-        title.append(&self.chat_avatar(chat, 28));
-        let words = bx(true, 0);
-        words.append(&text(&chat.name, "chat-title"));
-        let subtitle = if self
-            .typing
-            .borrow()
-            .get(&chat.jid)
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
-        {
-            "Typing…"
+        if chat.group {
+            self.header_presence.replace(None);
+            title.append(&self.chat_avatar(chat, 28));
         } else {
-            &chat.subtitle
-        };
-        words.append(&text(subtitle, "chat-subtitle dim-label"));
+            let dot = crate::components::PresenceAvatar::new(&self.chat_avatar(chat, 28));
+            dot.set_dot_visible(self.shows_contact_status());
+            title.append(&dot);
+            self.header_presence.replace(Some(dot));
+        }
+        let words = bx(true, 0);
+        words.append(&text(chat.display_name(), "chat-title"));
+        let subtitle = text("", "chat-subtitle dim-label");
+        words.append(&subtitle);
+        self.header_subtitle.replace(Some(subtitle));
+        self.update_chat_subtitle();
         title.append(&words);
         self.title.set_child(Some(&title));
         if let Some(a) = self
@@ -1586,6 +1817,25 @@ impl Ui {
             a.set_state(&chat.notifications.to_variant())
         }
     }
+    pub(crate) fn update_chat_subtitle(&self) {
+        let state = self.state.borrow();
+        let chat = state.current();
+        let composing = self.typing.borrow().iter().any(|((peer, _), at)|
+            peer == &chat.jid && at.elapsed() < crate::chat_states::TIMEOUT);
+        if let Some(dot) = self.header_presence.borrow().as_ref() {
+            dot.set_presence(self.contact_presence(chat));
+            dot.set_dot_visible(self.shows_contact_status());
+        }
+        if let Some(label) = self.header_subtitle.borrow().as_ref() {
+            let shown = if composing || chat.group {
+                None
+            } else {
+                Some(self.status_text(&chat.jid, &chat.subtitle))
+            };
+            label.set_text(if composing { "typing..." } else { shown.as_deref().unwrap_or(&chat.subtitle) });
+        }
+    }
+
     pub fn show_page(&self, title: &str, widget: &impl IsA<gtk::Widget>) {
         self.search_toggle.set_active(false);
         if let Some(old) = self.pages.child_by_name("section") {
@@ -1594,11 +1844,17 @@ impl Ui {
         self.pages.add_named(widget, Some("section"));
         self.pages.set_visible_child_name("section");
         self.title.set_visible(false);
+        self.participants_button.set_visible(false);
         self.section_title.set_text(title);
     }
     fn search_mode(self: &Rc<Self>, active: bool) {
         self.stories
             .set_visible(!active && self.state.borrow().account.is_empty());
+        let in_group = {
+            let state = self.state.borrow();
+            state.chats.iter().any(|c| c.id == state.active && c.group)
+        };
+        self.participants_button.set_visible(!active && in_group);
         if active {
             self.title.set_visible(false);
             self.titles.set_visible_child_name("search");
@@ -1630,9 +1886,9 @@ impl Ui {
         let state = self.state.borrow();
         let owner = state.account.clone();
         for c in &state.chats {
-            if c.name.to_lowercase().contains(&query) {
+            if c.display_name().to_lowercase().contains(&query) {
                 let row = adw::ActionRow::builder()
-                    .title(&c.name)
+                    .title(c.display_name())
                     .subtitle(&c.subtitle)
                     .use_markup(false)
                     .activatable(true)
@@ -1727,8 +1983,33 @@ impl Ui {
             );
         }
     }
-    pub fn command(&self, c: Command) -> bool {
+    pub fn command(&self, mut c: Command) -> bool {
+        if let Command::Send { peer, message, .. } = &mut c {
+            self.apply_send_anyway_cooldown(peer, message);
+        }
         self.session.borrow().as_ref().is_some_and(|s| s.send(c))
+    }
+    /// How long Send Anyway keeps applying to a room after the user chose it.
+    pub(crate) const SEND_ANYWAY_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+    /// Whether the Send Anyway button is offered at all (Preferences > Offer Send Anyway).
+    pub(crate) fn offers_send_anyway(&self) -> bool {
+        self.preference("offer_send_anyway", true)
+    }
+    /// Within the cooldown after Send Anyway, a message to that room is sent without the members
+    /// whose keys cannot be used, as the user already chose, instead of failing again.
+    pub(crate) fn apply_send_anyway_cooldown(&self, peer: &str, message: &mut Message) {
+        if self.send_anyway_active(peer) {
+            message.skip_unreachable = true;
+        }
+    }
+    /// Whether Send Anyway is on for `peer` right now: offered, chosen, and not yet expired.
+    pub(crate) fn send_anyway_active(&self, peer: &str) -> bool {
+        self.offers_send_anyway()
+            && self
+                .send_anyway_until
+                .borrow()
+                .get(peer)
+                .is_some_and(|until| *until > std::time::Instant::now())
     }
     pub fn send_content(self: &Rc<Self>, value: &str, kind: &str) -> Option<String> {
         if kind=="article" {return self.queue_formatted_text(value,Some(crate::formatting::Markup{body:value.into(),markdown:true,unstyled:true,..Default::default()}));}
@@ -1838,6 +2119,10 @@ impl Ui {
         if value.trim().is_empty() && self.attachments.borrow().is_empty() {
             return;
         }
+        // Client commands such as /neofetch are handled here and never queued or sent.
+        if self.attachments.borrow().is_empty() && self.run_client_command(&value) {
+            return;
+        }
         if !self.state.borrow().account.is_empty() {
             let files = self.attachments.borrow().clone();
             if files.is_empty() {
@@ -1879,7 +2164,7 @@ impl Ui {
             String::new()
         };
         let files_sent = live && !self.attachments.borrow().is_empty();
-        if files_sent && !self.send_files(value) {
+        if files_sent && !self.send_files(value, mode) {
             return;
         }
         let authored=self.composer_formatting().trim().styled();
@@ -1904,12 +2189,12 @@ impl Ui {
             if let Some(ref r) = reply {
                 message.reply = format!("{} · {}", r.author, r.reply_preview());
                 message.reply_id = if live {
-                    r.wire_id.clone()
+                    crate::message_actions::stanza_reference(r).unwrap_or_default()
                 } else {
                     r.id.clone()
                 };
-                message.reply_to = if group && !r.sender.is_empty() {
-                    r.sender.clone()
+                message.reply_to = if group {
+                    crate::message_actions::room_reply_address(r, &peer)
                 } else if r.own {
                     owner
                 } else {
@@ -1987,12 +2272,10 @@ impl Ui {
     pub fn update_mode(&self) {
         let live = !self.state.borrow().account.is_empty();
         self.update_history_spinner();
-        self.stories.set_visible(!live);
+        self.stories.set_visible(true);
         for name in [
             "wallet",
-            "stories",
             "spaces",
-            "profile",
             "developer",
             "call",
             "article",
@@ -2018,10 +2301,11 @@ impl Ui {
             t.set_enabled(
                 matches!(name.as_str(), "emoji" | "stickers")
                     || name == "gifs" && self.gif_page.borrow().is_some()
+                    || name == "monero"
                     || !live,
             )
         }
-        if live {
+        if self.media_stack.visible_child_name().as_deref().is_some_and(|name|self.media_toggles.borrow().get(name).is_none_or(|t|!t.is_enabled())) {
             self.media_stack.set_visible_child_name("emoji")
         }
     }
@@ -2053,6 +2337,14 @@ impl Ui {
             .set_label(if error { "Try Again" } else { "Sign In" });
     }
     pub fn activate_state(self: &Rc<Self>, mut state: State) {
+        // Rosters belong to the previous account's rooms.
+        self.room_rosters.borrow_mut().clear();
+        self.contact_status.borrow_mut().clear();
+        if self.participants.take().is_some()
+            && self.media_mode.borrow().as_str() == "participants"
+        {
+            self.utility.set_show_sidebar(false);
+        }
         let visible_sidebar = self
             .utility
             .shows_sidebar()
@@ -2065,8 +2357,14 @@ impl Ui {
             self.utility.set_sidebar(gtk::Widget::NONE);
         }
         self.stop_uploads();
+        self.recent_timelines.borrow_mut().clear();
+        self.rendered_rows.replace(Default::default());
+        self.bubbles.borrow_mut().clear();
+        while let Some(row) = self.timeline.first_child() { self.timeline.remove(&row); }
+        self.timeline.set_opacity(0.);
         self.images.borrow_mut().clear();
         self.avatars.borrow_mut().clear();
+        self.clear_legacy_room_pins(&mut state);
         for chat in &mut state.chats {
             for m in &mut chat.messages {
                 if let Some(draft) = &mut m.upload {
@@ -2088,6 +2386,10 @@ impl Ui {
         self.online.set(false);
         self.crypto.replace(Default::default());
         self.legacy_crypto.replace(Default::default());
+        if let Some(audio)=self.active_audio.borrow_mut().take().and_then(|a|a.upgrade()){audio.media.pause();}
+        self.profile_cache.borrow_mut().clear();
+        self.profile_controls.borrow_mut().take();
+        if let Some(popup)=self.active_profile.borrow_mut().take(){popup.popdown();if popup.parent().is_some(){popup.unparent();}}
         self.pq_crypto.replace(Default::default());
         self.pq_reviews.borrow_mut().clear();
         self.encryption_checks.borrow_mut().clear();
@@ -2118,11 +2420,14 @@ impl Ui {
         if let Some(v) = story {
             v.close()
         }
+        self.local_contacts.borrow_mut().clear();self.local_contact_avatars.borrow_mut().clear();
         self.state.replace(state);
+        self.reload_contact_details();
         self.load_favorite_orders();
         self.load_blocking_cache();
         self.rebuild_pack_library();
         self.rebuild_gif_library();
+        self.refresh_monero_sidebar();
         self.timeline_scope_changed();
         self.history_pages.borrow_mut().clear();
         self.history_pending.borrow_mut().clear();
@@ -2289,6 +2594,7 @@ impl Ui {
                 error,
                 text,
             } => {
+                self.connection_feedback(owner,online,error,&text);
                 if !online {
                     self.encryption_checks.borrow_mut().clear();
                     self.update_encryption_check();
@@ -2323,6 +2629,7 @@ impl Ui {
                     }
                 }
                 if !online {
+                    self.update_chat_subtitle();
                     let _ = self.store.interrupt_messages(owner);
                     let _ = self.store.interrupt_actions(owner);
                     let peers: Vec<_> = self
@@ -2347,10 +2654,10 @@ impl Ui {
                     self.room_sync_retry.borrow_mut().clear();
                     self.sync_room_bookmarks();
                     self.remember_sign_in(owner);
-                    self.load_history(true)
+                    self.load_history(true);
+                    self.refresh_live_stories(None);
                 } else if error {
                     self.login_secret.borrow_mut().take();
-                    self.notice(&text)
                 }
             }
             BackendEvent::Roster(update) => {
@@ -2374,9 +2681,12 @@ impl Ui {
                     c.contact = item.subscription != "remove" && !c.group && c.jid != owner;
                 }
                 drop(s);
+                self.apply_local_contact_names();
                 self.clear_contact_requests(&resolved);
                 self.refresh_contact_access();
+                self.refresh_live_stories(None);
             }
+            BackendEvent::StoriesChanged { owner } => self.refresh_live_stories(Some(owner)),
             BackendEvent::ContactAccessError(error) => self.notice(&error),
             BackendEvent::BlockingChanged(snapshot) => {
                 self.blocking_snapshot.replace(snapshot);
@@ -2405,8 +2715,15 @@ impl Ui {
                         bookmark.name
                     };
                 }
+                drop(state);
+                // Restore the visible room even when its bookmark does not autojoin.
+                // Wait for bookmark loading so imported room passwords/nicknames are available.
+                self.resume_current_chat();
             }
             BackendEvent::RoomPresence(presence) => {
+                if !presence.joined {
+                    self.typing.borrow_mut().retain(|(peer, _), _| peer != &presence.jid);
+                }
                 let mut state = self.state.borrow_mut();
                 let room = state.chat_for(&presence.jid);
                 room.group = true;
@@ -2421,10 +2738,14 @@ impl Ui {
                     if presence.joined {
                         self.load_history(true);
                     }
+                    self.sync_participants();
                 }
                 if presence.joined {
                     self.release_upload_captions();
                 }
+            }
+            BackendEvent::RoomRoster { room, participants } => {
+                self.room_roster_changed(&room, participants)
             }
             BackendEvent::RoomError(error) => self.notice(&error),
             BackendEvent::CryptoStatus(status) => {
@@ -2456,6 +2777,7 @@ impl Ui {
                 self.handle_pq_review(&peer);
             }
             BackendEvent::AvatarChanged { peer, hint } => {
+                self.profile_cache.borrow_mut().remove(&peer);
                 self.avatars.borrow_mut().invalidate(&peer, hint);
                 return;
             }
@@ -2481,7 +2803,10 @@ impl Ui {
                     errors,
                 );
             }
-            BackendEvent::CryptoError { peer, text } => self.notice(&format!("{peer}: {text}")),
+            BackendEvent::CryptoError { peer, text } => {
+                let title = format!("{peer}: {text}");
+                self.notice_resolving_authorization(&text, title);
+            }
             BackendEvent::InlineEmoji { peer, id, emoji } => {
                 if self
                     .store
@@ -2630,11 +2955,21 @@ impl Ui {
                 self.queue_chat_refresh();
                 return;
             }
+            BackendEvent::ContactStatus { peer, detail } => {
+                match detail {
+                    Some(detail) => self.contact_status.borrow_mut().insert(peer, detail),
+                    None => self.contact_status.borrow_mut().remove(&peer),
+                };
+                return;
+            }
             BackendEvent::Presence {
                 peer,
                 online,
                 visible,
             } => {
+                if visible && !online {
+                    self.typing.borrow_mut().retain(|(chat, _), _| chat != &peer);
+                }
                 let mut s = self.state.borrow_mut();
                 if let Some(c) = s.chats.iter_mut().find(|c| c.jid == peer) {
                     c.subtitle = if !visible {
@@ -2647,21 +2982,22 @@ impl Ui {
                     .into();
                 }
                 drop(s);
-                if self.pages.visible_child_name().as_deref() == Some("chat") {
-                    self.show_chat()
-                }
+                self.update_chat_subtitle();
+                self.refresh_profile_card();
+                self.queue_chat_refresh();
                 return;
             }
-            BackendEvent::Typing { peer, composing } => {
+            BackendEvent::Typing { peer, sender, composing } => {
                 if composing {
-                    self.typing.borrow_mut().insert(peer, Instant::now());
+                    self.typing.borrow_mut().insert((peer, sender), Instant::now());
                 } else {
-                    self.typing.borrow_mut().remove(&peer);
+                    self.typing.borrow_mut().remove(&(peer, sender));
                 }
-                if self.pages.visible_child_name().as_deref() == Some("chat") {
-                    self.show_chat()
-                }
+                self.update_chat_subtitle();
                 return;
+            }
+            BackendEvent::SentPartially { peer, id, skipped } => {
+                self.record_partial_send(owner, &peer, &id, &skipped);
             }
             BackendEvent::Uncertain { peer, id } => {
                 self.delivery(&peer, &id, "uncertain");
@@ -2675,9 +3011,23 @@ impl Ui {
             BackendEvent::Read { peer, id } => self.receive_read_marker(owner, &peer, &id, false),
             BackendEvent::OwnRead { peer, id } => self.receive_read_marker(owner, &peer, &id, true),
             BackendEvent::Receipt { peer, id } => self.delivery(&peer, &id, "delivered"),
-            BackendEvent::Failed { peer, id } => {
+            BackendEvent::Failed { peer, id, reason } => {
+                // Bounced typing, receipt and marker stanzas also arrive here; only one of our own
+                // messages is worth a toast (edits, reactions and removals toast in `delivery`).
+                let own_id = self.store.own_wire_id(owner, &peer, &id).ok().flatten();
+                if own_id.is_some() {
+                    let stage = if reason.starts_with("the server said") { "XMPP server response" } else { "Message submission" };
+                    if self.store.record_message_failure(owner, &peer, &id, stage, &reason).is_err() {
+                        self.notice("The send error could not be saved in Message Details");
+                    }
+                }
                 self.delivery(&peer, &id, "failed");
-                self.notice("Message could not be sent. Retry from its menu.");
+                let Some(own_id) = own_id else {
+                    return;
+                };
+                self.record_failure_reason(owner, &peer, &id, &reason);
+                let title = crate::text_safety::failed_send_toast(&crate::message_failures::safe_detail(&reason));
+                self.notice_send_failure(&peer, vec![own_id], &reason, title);
             }
             BackendEvent::History {
                 peer,
@@ -2703,6 +3053,7 @@ impl Ui {
                 self.clear_contact_request(&peer);
                 self.refresh_contact_access();
             }
+            BackendEvent::RoomInvitationsAccepted(rooms) => self.resolve_room_invitations(&rooms),
             BackendEvent::RoomInvitation(invitation) => {
                 self.receive_room_invitation(invitation);
             }
@@ -2777,6 +3128,7 @@ impl Ui {
                     .map(|m| m.id.clone())
             });
         let follow = self.at_message_end();
+        let animate_incoming=known.is_none()&&!historical&&!message.own&&visible&&follow;
         let mut s = self.state.borrow_mut();
         let active = s.current().jid == peer;
         let c = s.chat_for(&peer);
@@ -2793,7 +3145,7 @@ impl Ui {
         let receipt_id = message.wire_id.clone();
         let notify =
             known.is_none() && !visible && !message.own && !historical && c.notifications == "all";
-        let notification_title = c.name.clone();
+        let notification_title = c.display_name().to_string();
         let notification_body = message.preview();
         if let Some(known) = known.clone() {
             let old = c
@@ -2978,6 +3330,7 @@ impl Ui {
             }
         }
         if active && (!outside || inserted.is_none()) {
+            if saved&&animate_incoming { self.animate_received_message(&incoming_id); }
             self.render_messages(follow)
         } else if active {
             self.schedule_history_maintenance();
@@ -3025,6 +3378,54 @@ impl Ui {
             }
             Ok(None) => {}
             Err(_) => self.notice("Message delivery status could not be saved"),
+        }
+    }
+    /// Keep why the own message `id` failed on it, so Message Details can say what went wrong and the
+    /// toast can stay short.
+    pub(crate) fn record_failure_reason(self: &Rc<Self>, owner: &str, peer: &str, id: &str, reason: &str) {
+        let reason = crate::text_safety::failure_reason(reason);
+        match self.store.record_failure(owner, peer, id, &reason) {
+            Ok(Some(message)) => {
+                let mut state = self.state.borrow_mut();
+                let active = state.current().jid == peer;
+                let chat = state.chat_for(peer);
+                if let Some(row) = chat.messages.iter_mut().find(|m| m.id == message.id) {
+                    *row = message;
+                }
+                drop(state);
+                if active {
+                    self.render_messages(false);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => self.notice("Could not record why this message failed"),
+        }
+    }
+    /// Remember on the message that it went out without `skipped` room members, so its bubble and
+    /// its details can say so. The list is bounded; it is shown, never acted on.
+    pub(crate) fn record_partial_send(
+        self: &Rc<Self>,
+        owner: &str,
+        peer: &str,
+        id: &str,
+        skipped: &[(String, String)],
+    ) {
+        let skipped: Vec<(String, String)> = skipped.iter().take(200).cloned().collect();
+        match self.store.record_skipped(owner, peer, id, &skipped) {
+            Ok(Some(message)) => {
+                let mut state = self.state.borrow_mut();
+                let active = state.current().jid == peer;
+                let chat = state.chat_for(peer);
+                if let Some(row) = chat.messages.iter_mut().find(|m| m.id == message.id) {
+                    *row = message;
+                }
+                drop(state);
+                if active {
+                    self.render_messages(false);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => self.notice("Could not record who this message was not sent to"),
         }
     }
     pub(crate) fn update_history_spinner(&self) {
@@ -3082,5 +3483,179 @@ impl Ui {
             &format!("{key}:{}", self.state.borrow().account),
             if default { "true" } else { "false" },
         ) == "true"
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a private GTK display and D-Bus"]
+    fn composer_newlines_grow_by_complete_lines_without_premature_scroll() {
+        adw::init().unwrap();
+        let app=adw::Application::builder().application_id("com.negzero.ComposerNewlineFixture").flags(gio::ApplicationFlags::NON_UNIQUE).build();app.register(None::<&gio::Cancellable>).unwrap();
+        let ui=Ui::new(&app,true);
+        let css=gtk::CssProvider::new();css.load_from_path(crate::widgets::asset("style.css"));gtk::style_context_add_provider_for_display(&gdk::Display::default().unwrap(),&css,gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let fonts=gtk::CssProvider::new();gtk::style_context_add_provider_for_display(&gdk::Display::default().unwrap(),&fonts,gtk::STYLE_PROVIDER_PRIORITY_USER);
+        ui.window.set_default_size(900,700);ui.window.present();ui.composer.grab_focus();
+        let settle=||{let until=Instant::now()+Duration::from_millis(150);while Instant::now()<until{glib::MainContext::default().iteration(false);std::thread::sleep(Duration::from_millis(2));}};
+        settle();
+        let ids=std::process::Command::new("xdotool").args(["search","--name","^Monogram$"]).output().unwrap();let id=String::from_utf8(ids.stdout).unwrap().lines().last().unwrap().to_owned();assert!(std::process::Command::new("xdotool").args(["windowfocus","--sync",&id]).status().unwrap().success());settle();
+        let mut previous_line=0;
+        for font in [13,20] {
+            fonts.load_from_string(&format!(".composer textview {{font-size:{font}px;}}"));
+            ui.composer.buffer().set_text("asd");ui.composer.buffer().place_cursor(&ui.composer.buffer().end_iter());settle();settle();
+            let line=ui.composer.iter_location(&ui.composer.buffer().start_iter()).height();
+            assert!(line>previous_line);previous_line=line;
+            let padding=ui.composer.top_margin()+ui.composer.bottom_margin();
+            let mut previous_scroll=0.;
+            for lines in 1..=8 {
+                let started=Instant::now();
+                if lines>1 {assert!(std::process::Command::new("xdotool").args(["key","--clearmodifiers","shift+Return"]).status().unwrap().success());settle();settle();}
+                let expected=padding+line*lines.min(5);
+                assert_eq!(ui.input_scroll.height(),expected,"{font}px font, {lines} lines");
+                let adj=ui.input_scroll.vadjustment();
+                assert!((adj.page_size()-f64::from(expected)).abs()<1.,"viewport must reflect the new height immediately");
+                let caret=ui.composer.iter_location(&ui.composer.buffer().end_iter());let visible=ui.composer.visible_rect();
+                assert!(caret.y()>=visible.y() && caret.y()+caret.height()<=visible.y()+visible.height(),"caret clipped at{lines} lines: {caret:?} {visible:?}");
+                if lines<=5 {assert_eq!(adj.value(),0.,"fitting text must not scroll or center");}
+                else {assert!(adj.value()-previous_scroll<=f64::from(line)+1.,"one newline must not scroll farther than one line");assert!(visible.y()+visible.height()-caret.y()-caret.height()<=padding,"caret must stay near bottom, not centered");}
+                assert!(started.elapsed()<Duration::from_millis(400),"feedback exceeded400ms");
+                previous_scroll=adj.value();
+            }
+            eprintln!("Composer {font}px: full {line}px lines + {padding}px padding; five-line cap and minimal caret scrolling pass");
+        }
+        let started=Instant::now();
+        ui.composer.buffer().set_text(&"x\n".repeat(10_000));settle();
+        let line=ui.composer.iter_location(&ui.composer.buffer().start_iter()).height();
+        assert_eq!(ui.input_scroll.height(),ui.composer.top_margin()+ui.composer.bottom_margin()+5*line);
+        assert!(started.elapsed()<Duration::from_millis(400),"large paste blocked visible feedback");
+        ui.window.close();
+    }
+
+    /// Inserting an emoji (a glyph from another, taller font) must not make the message box taller.
+    #[test]
+    #[ignore = "requires a private GTK display and D-Bus"]
+    fn inserting_an_emoji_does_not_resize_the_message_box() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.negzero.ComposerEmojiHeightFixture")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let ui = Ui::new(&app, true);
+        let css = gtk::CssProvider::new();
+        css.load_from_path(crate::widgets::asset("style.css"));
+        gtk::style_context_add_provider_for_display(&gtk::gdk::Display::default().unwrap(), &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        ui.window.set_default_size(900, 700);
+        ui.window.present();
+        let context = glib::MainContext::default();
+        let settle = |ms: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle(400);
+        let height = |ui: &Rc<Ui>| ui.input_scroll.measure(gtk::Orientation::Vertical, ui.composer.width()).1;
+        let row = |ui: &Rc<Ui>| ui.composer.parent().map(|p| p.height()).unwrap_or(0);
+        for text in ["", "hello", "hello wörld ÅgyQ"] {
+            ui.composer.buffer().set_text(text);
+            ui.composer.buffer().place_cursor(&ui.composer.buffer().end_iter());
+            settle(150);
+            let (before, row_before) = (height(&ui), row(&ui));
+            for emoji in ["😀", "👍🏽", "❤️", "🇷🇴", "👨‍👩‍👧‍👦", "😀😀😀"] {
+                ui.composer.buffer().insert_at_cursor(emoji);
+                settle(150);
+                assert_eq!(height(&ui), before, "{text:?} + {emoji}: the text area changed height");
+                assert_eq!(row(&ui), row_before, "{text:?} + {emoji}: the message box changed height");
+            }
+            ui.composer.buffer().set_text("");
+            settle(100);
+        }
+    }
+
+    /// The composer is sized by its scroll window from its content in the same layout pass
+    /// (propagate_natural_height). Hand-syncing the height from an idle callback let GTK paint a
+    /// frame where the text had grown but the viewport had not, and fought GTK's scroll-to-caret.
+    #[test]
+    #[ignore = "requires a private GTK display and D-Bus"]
+    fn composer_height_follows_its_content_and_caps_without_manual_syncing() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.negzero.ComposerHeightFixture")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let ui = Ui::new(&app, true);
+        let css = gtk::CssProvider::new();
+        css.load_from_path(crate::widgets::asset("style.css"));
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        ui.window.set_default_size(900, 700);
+        ui.window.present();
+        let context = glib::MainContext::default();
+        let settle = |ms: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle(400);
+        let sentence = "The quick brown fox jumps over the lazy dog while the rest of the sentence keeps going on and on so that it wraps over several visual lines. ";
+        let height = |ui: &Rc<Ui>| ui.input_scroll.measure(gtk::Orientation::Vertical, ui.composer.width()).1;
+        let content = |ui: &Rc<Ui>| ui.composer.measure(gtk::Orientation::Vertical, ui.composer.width()).1;
+        // A one-line (or empty) composer must stay compact: the vertical scrollbar's own minimum
+        // height used to inflate it to ~58px.
+        assert!(height(&ui) <= 34, "empty composer is {}px tall", height(&ui));
+        let mut lines_seen = std::collections::BTreeSet::new();
+        let long = sentence.repeat(8);
+        for length in [10, 70, 140, 210, 280, 360, 500, 700] {
+            let text = &long[..length];
+            ui.composer.buffer().set_text(text);
+            settle(120);
+            let expected = content(&ui);
+            assert_eq!(height(&ui), expected, "{} chars: composer height must follow its content, capped at five lines", text.len());
+            lines_seen.insert(expected);
+        }
+        let cap=ui.composer.top_margin()+ui.composer.bottom_margin()+5*ui.composer.iter_location(&ui.composer.buffer().start_iter()).height();
+        assert!(lines_seen.len() >= 4 && lines_seen.contains(&cap), "heights seen: {lines_seen:?}; cap={cap}");
+        ui.composer.buffer().set_text("");
+        settle(120);
+        assert!(height(&ui) <= 34, "cleared composer is {}px tall", height(&ui));
+    }
+}
+
+#[cfg(test)]
+mod folder_empty_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires private native display/keyring"]
+    fn empty_folder_and_search_pages_keep_sliding() {
+        adw::init().unwrap();
+        let app=adw::Application::builder().application_id("com.negzero.MonogramDesktop.EmptyFolderFixture").flags(gio::ApplicationFlags::NON_UNIQUE).build();app.register(None::<&gio::Cancellable>).unwrap();
+        let ui=Ui::new(&app,true);ui.window.set_default_size(1380,900);ui.window.present();
+        let context=glib::MainContext::default();let settle=|ms|{let until=std::time::Instant::now()+std::time::Duration::from_millis(ms);while std::time::Instant::now()<until{context.iteration(false);std::thread::sleep(std::time::Duration::from_millis(1));}};
+        settle(300);
+        assert!(ui.chat_stack.is_mapped());
+        for chat in &mut ui.state.borrow_mut().chats {chat.unread=0;chat.unread_mark=false;}
+        ui.set_folder("Unread");
+        let empty=ui.chat_stack.visible_child().unwrap().downcast::<adw::StatusPage>().unwrap();assert_eq!(empty.title(),"No Conversations");
+        assert!(ui.chat_stack.is_transition_running(),"empty destinations still slide");settle(300);assert!(empty.height()>100);
+        ui.set_folder("All");assert!(ui.chat_stack.is_transition_running(),"leaving an empty folder still slides");settle(300);
+        ui.search.set_text("no-such-conversation-fixture");ui.refresh_chats(Some(true));
+        let empty=ui.chat_stack.visible_child().unwrap().downcast::<adw::StatusPage>().unwrap();assert_eq!(empty.title(),"No Results");settle(300);
+        assert_eq!(ui.chat_stack.pages().n_items(),1,"old transition pages are released");
+        ui.preferences();settle(100);
+        fn descendants(widget:&gtk::Widget,out:&mut Vec<gtk::Widget>){out.push(widget.clone());let mut child=widget.first_child();while let Some(w)=child {child=w.next_sibling();descendants(&w,out);}}
+        let dialog=ui.window.visible_dialog().unwrap();let mut widgets=Vec::new();descendants(dialog.upcast_ref(),&mut widgets);
+        let size=widgets.iter().find_map(|w|w.downcast_ref::<adw::SpinRow>().filter(|r|r.title()=="Maximum file size")).unwrap();assert_eq!(size.value(),15.);size.set_value(23.);assert_eq!(ui.auto_download_limit.get(),23*1024*1024);assert_eq!(ui.store.pref("auto_download_limit_mb",""),"23");
+        let toggle=widgets.iter().find_map(|w|w.downcast_ref::<adw::SwitchRow>().filter(|r|r.title()=="Automatically download media")).unwrap();assert!(toggle.is_active());toggle.set_active(false);assert!(!ui.auto_download_enabled.get());assert!(!size.is_sensitive());assert_eq!(ui.store.pref("auto_download_files",""),"false");dialog.close();ui.window.close();
     }
 }

@@ -1,4 +1,4 @@
-{ pkgs, lib, stdenv, pkg-config, protobuf, libomemo-c, openssl, gtk4, libadwaita, libepoxy, libglycin-gtk4, glycin-loaders, sqlite, wrapGAppsHook4, xorg-server, dbus, makeFontsConf, adwaita-fonts, gsettings-desktop-schemas, mesa, librsvg, prosody, cacert, python3, gnome-keyring, gst_all_1, clapper-unwrapped, bubblewrap, monogramSrc ? lib.cleanSource ./., craneLib ? import (builtins.fetchTarball {
+{ pkgs, lib, stdenv, pkg-config, protobuf, libomemo-c, openssl, gtk4, libadwaita, libepoxy, libglycin-gtk4, glycin-loaders, libultrahdr, sqlite, wrapGAppsHook4, xorg-server, dbus, makeFontsConf, adwaita-fonts, gsettings-desktop-schemas, mesa, librsvg, prosody, cacert, python3, gnome-keyring, gst_all_1, pipewire, clapper-unwrapped, bubblewrap, monogramSrc ? lib.cleanSource ./., craneLib ? import (builtins.fetchTarball {
   url = "https://github.com/ipetkov/crane/archive/79fd63528501446749c09f08cad486a58c7d173e.tar.gz";
   sha256 = "sha256-TREenflwEjxOSq292FYwbc3kEm7TDRtXCZRNWEdjBmg=";
 }) { inherit pkgs; } }:
@@ -18,7 +18,7 @@ let
     CARGO_BUILD_TARGET = stdenv.hostPlatform.rust.rustcTarget;
     PROTOC = "${protobuf}/bin/protoc";
     nativeBuildInputs = [ pkg-config protobuf wrapGAppsHook4 ];
-    buildInputs = [ clapper-unwrapped clapper-unwrapped.lib gtk4 libadwaita libepoxy libglycin-gtk4 glycin-loaders sqlite libomemo-c openssl librsvg gsettings-desktop-schemas gst_all_1.gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-good gst_all_1.gst-plugins-bad gst_all_1.gst-plugins-ugly gst_all_1.gst-libav ];
+    buildInputs = [ clapper-unwrapped clapper-unwrapped.lib gtk4 libadwaita libepoxy libglycin-gtk4 glycin-loaders sqlite libomemo-c openssl librsvg gsettings-desktop-schemas gst_all_1.gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-good gst_all_1.gst-plugins-bad gst_all_1.gst-plugins-ugly gst_all_1.gst-libav pipewire ];
     doCheck = false;
   };
   # Only manifests/lockfiles and the real path dependency affect this source.
@@ -33,14 +33,16 @@ let
   cargoVendorDir = craneLib.vendorCargoDeps { inherit src; };
   cargoArtifacts = craneLib.buildDepsOnly ((builtins.removeAttrs commonArgs [ "src" ]) // {
     inherit dummySrc cargoVendorDir;
-    cargoCheckExtraArgs = "--bin monogram-desktop --bin monogram-sticker-renderer";
-    cargoBuildExtraArgs = "--bin monogram-desktop --bin monogram-sticker-renderer";
+    cargoCheckExtraArgs = "--bin monogram-desktop --bin monogram-sticker-renderer --bin monogram-media-author --bin monogram-audio-preview";
+    cargoBuildExtraArgs = "--bin monogram-desktop --bin monogram-sticker-renderer --bin monogram-media-author --bin monogram-audio-preview";
   });
 in craneLib.buildPackage (commonArgs // {
+  # Decoder/sink additions do not invalidate the unchanged Rust dependency build.
+  buildInputs = commonArgs.buildInputs ++ [ libultrahdr gst_all_1.gst-plugins-rs ];
   MONOGRAM_MATH_HELPER = "${mathRenderer}/bin/monogram-math-renderer";
   MONOGRAM_BWRAP = "${bubblewrap}/bin/bwrap";
   inherit cargoArtifacts cargoVendorDir;
-  cargoBuildExtraArgs = "--bin monogram-desktop --bin monogram-sticker-renderer";
+  cargoBuildExtraArgs = "--bin monogram-desktop --bin monogram-sticker-renderer --bin monogram-media-author --bin monogram-audio-preview";
   passthru = { inherit cargoArtifacts gtk4Fixed mathRenderer; };
   nativeCheckInputs = [ xorg-server dbus prosody openssl python3 gnome-keyring ];
   postCheck = ''
@@ -78,16 +80,22 @@ in craneLib.buildPackage (commonArgs // {
     mkdir -p $out/share/monogram-desktop $out/share/applications $out/share/icons/hicolor/scalable/apps $out/share/doc/monogram-desktop
     cp -r assets/. $out/share/monogram-desktop/
     cp data/com.negzero.MonogramDesktop.desktop $out/share/applications/
+    mkdir -p $out/share/mime/packages
+    cp data/com.negzero.MonogramDesktop.xml $out/share/mime/packages/
     cp data/icons/com.negzero.MonogramDesktop.svg $out/share/icons/hicolor/scalable/apps/
     cp -r LICENSE LICENSES $out/share/doc/monogram-desktop/
     cp native/NOTICE.md $out/share/doc/monogram-desktop/native-NOTICE.md
     cp native/gtk-gpu-clip-restore.patch $out/share/doc/monogram-desktop/
     mkdir -p $out/libexec
     mv $out/bin/monogram-sticker-renderer $out/libexec/monogram-sticker-renderer
+    mv $out/bin/monogram-media-author $out/libexec/monogram-media-author
+    mv $out/bin/monogram-audio-preview $out/libexec/monogram-audio-preview
     gappsWrapperArgs+=(
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ gtk4Fixed ]}
       --set MONOGRAM_MATH_HELPER ${mathRenderer}/bin/monogram-math-renderer
       --set MONOGRAM_LOTTIE_HELPER $out/libexec/monogram-sticker-renderer
+      --set MONOGRAM_MEDIA_AUTHOR_HELPER $out/libexec/monogram-media-author
+      --set MONOGRAM_AUDIO_PREVIEW_HELPER $out/libexec/monogram-audio-preview
       --set MONOGRAM_BWRAP ${bubblewrap}/bin/bwrap
       --prefix XDG_DATA_DIRS : $out/share
       --set MONOGRAM_ASSET_DIR $out/share/monogram-desktop

@@ -240,7 +240,7 @@ mod tests {
             height: None,
             hashes: Default::default(),
             manual: false,
-            sticker: false,
+            sticker: false, voice: false,
         });
         let mut caption = message("caption-stable", true);
         caption.encrypted = true;
@@ -418,7 +418,6 @@ impl Store {
                 sender.author == owner
                     && sender.room == peer
                     && sender.occupant == base.sender
-                    && base.mode() == Mode::Pq
             });
         (base.own
             && current.own
@@ -449,7 +448,7 @@ impl Store {
                 || !request.own
                 || request.sender != owner
                 || request.mode() != base.mode()
-                || !matches!(&request.action,Some(Action::Retract{target,..}) if Some(target.clone())==actions::original_wire(&base))
+                || !matches!(&request.action,Some(Action::Retract{target,..}) if Some(target.clone())==actions::stanza_reference(&base))
             {
                 return Err(rusqlite::Error::InvalidQuery);
             }
@@ -714,7 +713,7 @@ impl Ui {
                     self.notice("The original message's encryption is not ready. Nothing was deleted; reconnect and try again.");
                     return;
                 };
-                let Some(target) = actions::original_wire(base) else {
+                let Some(target) = actions::stanza_reference(base) else {
                     return;
                 };
                 let wire = new_id();
@@ -740,9 +739,12 @@ impl Ui {
                 ));
             }
         }
-        self.notice("Deleting selected messages…");
+        // The write is local and normally instant: say something only if it is not.
+        let slow = self.notice_if_slow("Deleting selected messages…", crate::slow_notice::SLOW_AFTER);
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
+            // Dropped on every way out of this block, which cancels or dismisses the notice.
+            let _slow = slow;
             let Some(ui)=weak.upgrade() else{return};
             let (a,p,ids)=(prep.owner.clone(),prep.peer.clone(),prep.ids.clone());
             let result=ui.store.write_snapshot(move |store|store.apply_selected_deletion(&a,&p,&ids,&requests)).await;
@@ -756,6 +758,10 @@ impl Ui {
                 }
             }
             if ui.state.borrow().account==prep.owner {
+                // Capture after the worker returns: the user may have scrolled while it ran.
+                let position=(ui.state.borrow().current().jid==prep.peer).then(||{
+                    ui.deletion_scroll_target(&rows.iter().map(|row|row.id.clone()).collect::<Vec<_>>())
+                });
                 let removed:HashSet<_>=rows.iter().map(|m|m.id.as_str()).collect();
                 let mut state=ui.state.borrow_mut();
                 let exists=if let Some(chat)=state.chats.iter_mut().find(|chat|chat.jid==prep.peer) {
@@ -764,8 +770,8 @@ impl Ui {
                 drop(state);
                 if !exists {ui.flush_local_retractions();return;}
                 ui.sync_latest_preview(&prep.owner,&prep.peer);
-                if ui.state.borrow().current().jid==prep.peer {
-                    ui.history_window.content_changed();ui.clear_selection();ui.render_messages(false);
+                if let Some(position)=position {
+                    ui.history_window.content_changed();ui.clear_selection();ui.render_messages_at(position);
                 }
                 ui.refresh_chats(None);
                 if request_own && prep.ineligible_own_count>0 {ui.notice("Deleted locally. Only eligible sent messages have removal requests; unsent or unsupported messages were removed locally.");}

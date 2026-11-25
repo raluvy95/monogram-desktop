@@ -1,5 +1,11 @@
 # Feature parity ledger
 
+Both clients retain per-message failure details across retries, including safe
+transport/encryption causes and server status/conditions. Desktop exposes a
+bounded history with Copy in Message Details; mobile exposes its native full
+diagnostic viewer. Prior unsaved failures cannot be reconstructed. The desktop
+post-cache OMEMO2 upload handoff is covered by an isolated native regression.
+
 Target: all shipped Monogram behavior, with desktop-specific presentation.
 Android baseline: `ec4a3fa3e9f7167e7e4976427dee290d3bbc3e02` / 0.2.197.
 
@@ -13,29 +19,41 @@ an in-memory interaction or surface; "planned" means it is still absent.
 | Feature family | Current prototype | Required for product parity |
 | --- | --- | --- |
 | Account onboarding, multiple accounts, reconnect and proxy | Native first-run XMPP sign-in, verified TLS, cancellable session, automatic socket reconnect and keyring-backed sign-in, saved account profiles with one active connection, generation-fenced callbacks | In-app registration and invitations, simultaneous connections, proxy and certificate-review UI, broader provider testing |
-| Chat list, search, folders, unread/archived/saved chats | Live roster/chats sorted by recency below pinned chats, local archive search, durable local archive/pin/unread markers and folder rules/order, XMPP self-chat; restored room join failures stay in room status with stale-operation fencing, and failed background bookmark loads retain cached choices | Server search, more local search results/filters, pin ordering, tags, account-wide archive synchronization |
-| LAN device sync | [QR and typed TOTP pairing, TLS 1.3/SPAKE2, encrypted portable records, mesh forwarding, account/credential, pack, folder, fingerprint and wallet-capsule adapters](DEVICE_SYNC.md) on both clients | Physical phone/LAN acceptance; desktop wallet capsules are securely stored/relayed but its pre-existing production wallet engine is still absent |
+| Delete account on server | Desktop-only so far: Accounts → Delete (XEP-0077 cancel registration) after typing the full address to confirm; the local account is removed only once the server answers success, and a refusal, timeout or dropped stream leaves it in place. Removing an account now also clears its GIF library | Mobile has no server-side deletion; in-band account creation and invite links are not implemented on either client |
+| Server commands and invite links | Desktop-only so far: Accounts → Server → Server Commands (XEP-0050 with XEP-0004 forms, multi-step, cancel on close, bounded parsing, plain-text rendering) and Create Invite Link (XEP-0401 `urn:xmpp:invite#invite`; only `xmpp:` and `https://` links are shown, with copy buttons) | Mobile has neither; not yet tried against a live server; creating an account from an invite link (XEP-0077 with a pre-auth token) is not implemented on either client |
+| Chat list, search, folders, unread/archived/saved chats | Live roster/chats sorted by recency below pinned chats, Alt+Left/Right navigation through visible folders and Alt+Up/Down through the current folder’s ordered chats, local archive search, durable local archive/pin/unread markers and folder rules/order, XMPP self-chat; restored room join failures stay in room status with stale-operation fencing, and failed background bookmark loads retain cached choices | Server search, more local search results/filters, pin ordering, tags, account-wide archive synchronization |
+| LAN device sync | [QR and typed TOTP pairing, TLS 1.3/SPAKE2, encrypted portable records, mesh forwarding, account/credential, pack, folder, fingerprint and wallet-capsule adapters](DEVICE_SYNC.md) on both clients | Cancellation/progress and legacy-folder export covered by production UI/core/JNI tests; physical phone/LAN acceptance; desktop wallet capsules are securely stored/relayed but its pre-existing production wallet engine is still absent |
 | KeePass credentials | [Android Autofill / KeePassDX and explicit encrypted KeePassXC fill/save](KEEPASS.md), per-account associations in the existing keyring, immediate waiting feedback and cancellation | Real KeePassDX provider acceptance on a phone; live KeePassXC GUI acceptance blocked by fixture startup crash |
-| Text, composer, drafts | Live text, sender clustering, inline message status, retained media rows, reply cards, durable history, debounced text/reply/formatting drafts, custom composer layout with a Nautilus-style focus outline, [composer-to-bubble send transition](SEND_ANIMATION.md) with reduced-motion support, pasted/picked media staged inside the filled composer as removable cards with filename overlays until Send, native shaped-line sizing with capped scrolling and Escape clearing text while retaining attachments, centered full-opacity XEP-0245 `/me` action pills preserving original bodies, optimistic durable text/media queue before encryption checks with offline/reconnect flushing, explicit retry and receipt state | Ambiguous-send reconciliation, attachment drafts |
+| Text, composer, drafts | Live text, sender clustering, inline message status, retained media rows, reply cards, durable history, debounced text/reply/formatting drafts, custom composer layout with a Nautilus-style focus outline, complete display-line growth through five visible lines and minimal caret scrolling, [composer-to-bubble send transition](SEND_ANIMATION.md) with reduced-motion support, pasted/picked media staged inside the filled composer as removable cards with filename overlays until Send, native shaped-line sizing with capped scrolling and Escape clearing text while retaining attachments, centered full-opacity XEP-0245 `/me` action pills preserving original bodies, optimistic durable text/media queue before encryption checks with offline/reconnect flushing, explicit retry and receipt state | Ambiguous-send reconciliation, attachment drafts |
+| Motion photos | [JPEG Motion Photo](MOTION_PHOTOS.md) still + embedded MP4 sent together through SFS/OMEMO; mobile native live-photo projection; desktop still-first click playback and original-still restoration | Real phone UI acceptance; HEIC/AVIF motion containers and separate Apple library pairs |
 | Message actions | Live reply/copy/[attributed text/poll forwarding and Hide Sender](FORWARDING.md)/details, local delete/pin, selection/batch actions and [direct corrections/reactions/retractions](MESSAGE_ACTIONS.md), including explicit OMEMO 2; pinned-first compact reactions, continuous searchable emoji sections, reversible expansion from the compact pill, and timestamps sharing every nonempty reaction row | Room/attachment/rich forwarding actions, full backend permissions and wider interoperability |
 | Rich formatting, articles, tables, spoilers | [Mobile-source formatting](FORMATTING.md): native selectable styled ranges, bounded Markdown blocks/tables/lists/details/footnotes, sandboxed native MicroTeX, whole/partial/media spoilers, composer formatting, saved formatting drafts, corrections, forwarding and captions; authenticated modern metadata and restricted Legacy hints | Real-contact formatted-message acceptance; Telegram-only embedded article media/widgets and custom-emoji article composition are outside mobile’s text-only Markdown transport |
 | Replies and quoted content | Live stable-ID references and Unicode-code-point fallback quoting/removal, full-width two-line quote cards with word-boundary ellipses (over-wide words can split); sender-scoped loaded-history resolution and mobile-style 36 px cropped image thumbnails from authenticated media, including archived originals outside the viewport | Complete alias recovery across unloaded history, MAM reply lookup, room author checks |
 | Polls and reactions | [Structured direct polls](STRUCTURED_POLLS.md): native composer/results, durable ballots, revotes/withdrawal, author closure/cutoff, bodyless and OMEMO 2; historical canonical mobile body cards/votes/closure/attributed fresh forwarding; mobile structured send and durable metadata | Mobile fallback UI toggle, room backend, uncertain-send reconciliation and broader interoperability |
-| Standard/custom emoji, stickers and GIFs | Tab-only colon completion (Basic; Preferences → Behavior also offers Discord-style: two characters, Enter accepts, cursor before the last letter bypasses) and Ctrl+; chooser, searchable mobile category artwork, frequency-ranked built-in recents and shared persistent favorites/pins, custom packs in Emoji and separate sticker packs, local/XMSP/Telegram pack import and native Android XMSP export verified through SAF into the desktop library, persistent native desktop favorite drag/Alt+Arrow reordering with mixed built-in/custom emoji rows and independent recents, custom inline artwork with Unicode fallback, sticker/GIF favorites/recents, explicit-key GIPHY search with a keyless Add key action, [Galeria-derived justified GIF grid](GIF_GRID.md) with viewport controls, overlay favorites and automatic offset paging, bounded looping raster/TGS playback | Mobile favorite drag reordering, mobile pack-export process-death restoration/large-copy lifecycle, real-provider acceptance with configured GIPHY/Telegram credentials, complete pack management UI, WebM sticker coverage and full icon-pack replacement |
-| Files and media | [Live direct/room SFS/OOB reception and authenticated HTTPS downloads](FILE_TRANSFERS.md), automatic visible image downloads up to 10 MiB for trusted chats, inline animated images and sticker hints, account-scoped originals and derived thumbnail cache, prepared-video reuse, sized progress/cancel placeholders and plaintext/OMEMO 2 captions plus durable Legacy caption companions displayed with their media; direct and room Legacy/plain XEP-0363 uploads with immutable snapshots, bounded queue, Cancel/Retry and interrupted-draft recovery | Transient GTK sizing warning during compact sticker loading, voice thumbnails, complete content-type upgrades, adjustable download policy, durable jobs, complete cache lifecycle, caption edits/forwarding, albums and PQ room transport |
-| Viewer and playback | Live square three-column shared-media grid with automatic nine-item paging, underfill loading, exhaustion/retry feedback and conversation-scoped refresh, sandboxed inline photos, thumbnail-triggered overlay, fly-in/fly-out, fullscreen fit with idle control hiding and gradients, shared image/GIF/video focus with Galeria’s actual Clapper player/SimpleControls and arc transitions, pointer-anchored wheel/pinch zoom and bounded drag panning, always-looping GIF/animated-sticker playback, verified circular round-video previews with inline audible play/pause, sticker-free media navigation and a 21-item window (selected photo plus up to 10 on each side) | Complete playback preferences, audio/voice controls, round-video radial seeking and remaining-time labels, and editor behavior |
+| Standard/custom emoji, stickers and GIFs | [Bundled Noto emoji animation](ANIMATED_EMOJI.md) plays once/replays on click and settles on the marked rest pose (ordinary glyph fallback when unmarked); Tab-only colon completion (Basic; Preferences → Behavior also offers Discord-style: two characters, Enter accepts, cursor before the last letter bypasses) and Ctrl+; chooser, searchable mobile category artwork, frequency-ranked built-in recents and shared persistent favorites/pins, custom packs in Emoji and separate sticker packs, local/XMSP/Telegram pack import and native Android XMSP export verified through SAF into the desktop library, persistent native desktop favorite drag/Alt+Arrow reordering with mixed built-in/custom emoji rows and independent recents, custom inline artwork with Unicode fallback, sticker/GIF favorites/recents, explicit-key GIPHY search with a keyless Add key action, [Galeria-derived justified GIF grid](GIF_GRID.md) with viewport controls, overlay favorites and automatic offset paging, bounded looping raster/TGS playback Preferences → Behavior → Stickers: the Stickers tab stays open after sending by default; switching it off closes the pane after a sent sticker unless Shift is held while clicking. | Mobile favorite drag reordering, mobile pack-export process-death restoration/large-copy lifecycle, real-provider acceptance with configured GIPHY/Telegram credentials, complete pack management UI, WebM sticker coverage and full icon-pack replacement |
+| Files and media | [Live direct/room SFS/OOB reception and authenticated HTTPS downloads](FILE_TRANSFERS.md), automatic visible media downloads with a configurable 15 MiB default for trusted chats, inline animated images and sticker hints, account-scoped originals and derived thumbnail cache, prepared-video reuse, sized progress/cancel placeholders and plaintext/OMEMO 2 captions plus durable Legacy caption companions displayed with their media; direct and room Legacy/plain XEP-0363 uploads with immutable snapshots, bounded queue, Cancel/Retry and interrupted-draft recovery | Transient GTK sizing warning during compact sticker loading, voice thumbnails, complete content-type upgrades, adjustable download policy, durable jobs, complete cache lifecycle, caption edits/forwarding, albums and PQ room transport |
+| Viewer and playback | Live square three-column shared-media grid with automatic nine-item paging, underfill loading, exhaustion/retry feedback and conversation-scoped refresh, sandboxed inline photos, thumbnail-triggered overlay, fly-in/fly-out, fullscreen fit with idle control hiding and gradients, shared image/GIF/video focus with Galeria’s actual Clapper player/SimpleControls and arc transitions, pointer-anchored wheel/pinch zoom and bounded drag panning, always-looping GIF/animated-sticker playback, verified circular round-video previews with inline audible play/pause, sticker-free media navigation and a 21-item window (selected photo plus up to 10 on each side) Playback refuses files that do not start like a binary media container (a manifest or playlist saved as `video/*` is not played), and GStreamer network sources and adaptive demuxers (HLS, DASH, Smooth Streaming) are disabled, so a media file can never make the client contact an address written inside it. | Complete playback preferences, audio/voice controls, round-video radial seeking and remaining-time labels, and editor behavior |
 | HTML widgets | Upstream sandbox source audited; no renderer/runtime integrated | Resolve upstream licensing, GTK host and compatible XMPP proposal; enforce accepted **16 KiB compressed** budget plus independent expansion/memory/execution bounds on both clients |
-| Media authoring | Planned | Crop/trim/markup, compression, albums, camera capture and desktop permission/device flows |
+| Client-side commands | Desktop-only `/neofetch` (not in mobile): typed in the composer and sent with Enter, it is replaced by a generated code block (model or motherboard, processor, memory, total disk, uptime, distribution, Monogram version and git commit) left in the composer to edit and send; the command itself is never sent. Never includes the user or host name; read from /proc and /sys without subprocesses. The commit is embedded at build time (`MONOGRAM_GIT_COMMIT` for builds without git) | More commands, command hints in the composer, an ASCII logo, auto-send option |
+| Audio preview | [Player for audio attachments](AUDIO_PREVIEW.md): round play button, waveform and duration for `.ogg`/`.oga`/`.opus`, `.mp3`, `.wav`, `.m4a` and audio-only `.webm`; strict header validation, decoding only in a bubblewrap helper that outputs fixed-format PCM, playback of that PCM only, click or key seeking, one player at a time | Playback speed, a mini player that follows you between chats |
+| Animated single emoji | [Noto animations](ANIMATED_EMOJI.md): a message that is exactly one bundled emoji plays its Lottie animation once in view and on click, rendered in the confined helper with emoji-only limits; curated 250-emoji pack (about 2.1 MB), optional full-set pack placeholder, reduced-motion respected | Skin-tone variants; a setting to turn it off separately from big emoji |
+| Media authoring | [Plan model and limits](MEDIA_AUTHORING.md): validated crop/rotate/trim/scale plans with hard source, output and job-size bounds; GStreamer backend running in a bubblewrap-confined helper with a minimal plugin allowlist, header-bounded JPEG/PNG/WebP crop, rotate and scale with EXIF orientation, verified output and cancellation; Edit Picture dialog (crop with handles, rotate, crop shapes, numeric and keyboard crop, square, circle, arrow, pen-pressure freehand and text marks with colour and size, drawn by the helper) from the composer's attachment cards | video trim/compression with progress and cancel, albums as one message (XEP-0447 multi-file) with a grouped display (the composer already orders files and shares a caption), camera capture through the desktop portal |
+| Camera photos | Desktop-only so far (mobile uses the system camera app): attach menu → Take Photo… asks the **desktop camera portal** for permission and only after a yes opens its PipeWire connection (`pipewiresrc`), bounded to 1080p RGBA at 30 fps. Pages for denied, question closed, no camera, no portal, no answer and errors; closing stops the camera. Photos are JPEGs in the private temporary-copy folder. Permission steps are tested against a fake portal on a private bus. [CAMERA.md](CAMERA.md) | Mobile's dedicated camera button with hold-to-record round video is implemented on mobile only; desktop deliberately has portal photo capture alone for now (rarely used on desktop, hold gestures suit touch). A real camera behind a real portal has not been tried; choosing between cameras, video capture and calls |
+| Voice messages | Desktop: a microphone button after the emoji button; hold to record, let go to send, slide left or Esc to cancel, Enter/Space for keyboard use. The message box becomes a recording bar with an accent-coloured moving waveform and a `00:00` timer. Records mono Ogg Opus (24 kbit/s) that the app's player and validator accept, in a private temporary file; opened in the background so the window never waits; anything not clearly sent (limit, unplugged microphone, lost pointer) is kept in the message box for review; never sent to a different conversation; honours the desktop's `disable-microphone` switch and explains refusals. [VOICE.md](VOICE.md) | Mobile's own recording is its Telegram-based UI. Real microphone and sound-server behaviour has only been tested with GStreamer test sources; locking, pausing and preview before sending are not included |
 | Locations and previews | Location card/form preview | Real safe map rendering, provider privacy, coordinates, live/location selection and valid fallback removal |
-| Legacy OMEMO in DMs/MUCs | [Live Legacy OMEMO direct and room text/replies/attachments](LEGACY_OMEMO.md), authenticated same-author cross-device direct XEP-0424 retractions and consented public XEP-0444 reactions, complete member/own-device targets, separate durable identity/ratchet/trust, live/carbon/MAM receive and default-on direct-contact blind trust and separate room opt-in including conversation-scoped own devices | Rich actions, embedded-thumbnail receive, broader recovery and independent mobile room coverage |
+| Link previews | HTTPS-only text cards fetched through DNS-pinned, public-address-only requests, with `og:image` thumbnails decoded by the sandboxed image loader. Remote `og:video` is never downloaded or decoded, because that would run GStreamer on a stranger's bytes inside the main process; WebM sticker posters use a libvpx-only decoder allowlist | Mobile shows video thumbnails for pages and links that only offer `og:video`; desktop intentionally shows the text card without one until video decoding is sandboxed |
+| Legacy OMEMO in DMs/MUCs | [Live Legacy OMEMO direct and room text/replies/attachments](LEGACY_OMEMO.md), authenticated same-author cross-device direct XEP-0424 retractions and consented public XEP-0444 reactions, complete member/own-device targets, separate durable identity/ratchet/trust, live/carbon/MAM receive and default-on contact and room fingerprint trust including conversation-scoped own devices | Rich actions, embedded-thumbnail receive, broader recovery and independent mobile room coverage |
 | OMEMO2 / Monocles PQ | Sending choice OMEMO2 uses the pinned Monocles hybrid PQ backend with separate encrypted identity/ratchet/trust and durable inbox/outbox; Legacy, Classic and PQ incoming decryption and fingerprint reviews stay independent of sending choice. Actual mobile Java/JNI bidirectional/restart/tamper checks, isolated TLS actor/PEP send/reply and live provider bundle publication verified; Classic [receive compatibility](OMEMO2.md) retained | PQ room runtime acceptance, complete background retry and rich content, restore/migration/revocation and remaining mobile policies |
-| Device and contact access control | Separate Legacy, Classic and full hybrid PQ fingerprint reviews, default-on direct-contact authenticated blind trust, own-device review plus conversation-scoped automatic PQ own-device approval on both clients when blind trust is enabled (explicit blocks preserved), and public key PEP setup; live RFC-6121 directional contact request/allow/accept/deny/cancel/revoke with account-local durable auto-approval, server-confirmed status, metadata-preserving revocation and reactive native controls | Matching mobile contextual own-device blind trust in Legacy/Classic, live Legacy/PQ room trust acceptance, device revocation and broader trust lifecycle acceptance |
-| Groups, MUCs, MIX and Spaces | Live bookmarked MUC discovery, autojoin, join presence, plain/Legacy-encrypted text, replies and attachments, room MAM paging, complete offline member discovery, fresh before/after encryption checks and revision-fenced real-JID contexts, real private-group creation/service discovery and explicit room join/leave, durable nickname/autojoin choices, private XEP-0402 bookmark writes and separate keyring room passwords; native public-room browser using service discovery, RSM paging/unpaged fallback, cumulative failures and explicit Join; spaces/channel form/list previews | Room details, full membership and role editing, room rich content/PQ encryption, live MIX and Spaces |
+| Device and contact access control | Separate Legacy, Classic and full hybrid PQ fingerprint reviews, default-on contact/room authenticated blind trust, own-device review plus conversation-scoped automatic PQ own-device approval on both clients when blind trust is enabled (explicit blocks preserved), and public key PEP setup; live RFC-6121 directional contact request/allow/accept/deny/cancel/revoke with account-local durable auto-approval, server-confirmed status, metadata-preserving revocation and reactive native controls | Matching mobile contextual own-device blind trust in Legacy/Classic, live Legacy/PQ room trust acceptance, device revocation and broader trust lifecycle acceptance |
+| Groups, MUCs, MIX and Spaces | Participants panel (header button with a people icon, and header menu): virtualised Owners/Administrators/Participants sections with counts, live presence from occupant presence, search and invite by address; Live bookmarked MUC discovery, autojoin, join presence, plain/Legacy-encrypted text, replies and attachments, room MAM paging, complete offline member discovery, fresh before/after encryption checks and revision-fenced real-JID contexts, per-message Send Anyway that leaves out members whose Legacy OMEMO keys cannot be used, shown by a "Sent partially" lock and listed in Message Details (desktop only so far; mobile behavior not yet compared), real private-group creation/service discovery and explicit room join/leave, durable nickname/autojoin choices, private XEP-0402 bookmark writes and separate keyring room passwords; native public-room browser using service discovery, RSM paging/unpaged fallback, cumulative failures and explicit Join; spaces/channel form/list previews | Room details, offline-member and role editing in the participants panel, room rich content/PQ encryption, live MIX and Spaces |
 | Invitations and contact requests | Durable account-scoped contact requests with paged review, acknowledged accept-and-request-back responses, one-way permission controls and server withdrawal/authorization reconciliation; mediated/direct room invitation inbox, encrypted invitation passwords, confirmed join/local dismissal, revision guards and durable keyring cleanup; empty Requests and invitations controls hidden on both clients; created groups grant selected members and send mediated invitations with per-recipient failures | Cross-device dismissal and full invitation management |
-| Presence and typing | Roster-authorized multi-resource status with unknown/unshared presence hidden, stale startup status cleared, and live direct typing with expiry/privacy control; clears on disconnect | Group states, full carbons/delay/archive rejection and broader interoperability |
+| Presence and typing | Roster-authorized multi-resource status with unknown/unshared presence hidden; live XEP-0085 direct and joined-room typing replaces the header status, aggregates resources/occupants, restores normal status on pause/content/expiry/disconnect, rejects delayed/carbon/archive replay, and uses the mobile 120-second composing fallback; outgoing room states use groupchat and retain the sending privacy control | Independent real-contact interoperability acceptance |
+| Status circle and last interaction (XEP-0319) | Desktop-only so far (mobile has no equivalent): a circle on direct-chat avatars in the chat list, conversation header and profile card: green online, yellow away/xa, red do-not-disturb, grey for offline, unknown or presence not shared with us (refused or no subscription). Room occupants in a profile card use their room presence. The most reachable of a contact's devices is shown; `<idle since>` is read from presence (XEP-0082 time, future/ancient/malformed values dropped) and added to the status text as "Away · idle for 12 minutes · since Sat July 4 2015 23:25" without changing the colour. Every colour also has a word in its tooltip and accessible name. Preferences → Privacy and Notifications has "Show contacts’ status and idle time" (on by default; off removes the circle and the extra words at once). Our own idle time is never sent | Mobile equivalent; sending our own idle time is a separate privacy choice, not made yet |
+| Last seen (XEP-0012) | Desktop-only so far (mobile has no equivalent): "Offline" gives way to "Last seen 15 minutes ago · Sat July 4 2015 23:25" in the header and profile card, only after the account's server advertises `jabber:iq:last` and the contact's server answers; `forbidden`, any other error, timeouts and malformed seconds show nothing and are not retried for five minutes; answers are reused for a minute; room occupants, resources, blocked contacts and the preview account are never asked; Preferences → Privacy and Notifications has "Show when contacts were last seen" (on by default; off hides it and stops asking at once, and nothing about it is sent to the contact) | Mobile equivalent; live interoperability check against a real server |
+| Hats (XEP-0317) | Desktop-only so far (mobile has no equivalent): hats are read from occupant presence and shown as outlined, unfilled pills coloured from the hat's `hue` next to participants and message authors, **only in rooms whose disco#info advertises `urn:xmpp:hats:0`** (a room that does not could reflect a forged hat from any occupant). Titles are cleaned, at most eight hats per person; the colour is chosen per light/dark scheme to keep at least 4.5:1 contrast on every background it can sit on (swept over every hue in tests) and falls back to the plain foreground in high contrast. Preferences → Privacy and Notifications has "Show hats in rooms" (on by default). Creating, assigning and destroying hats (ad-hoc commands) is not implemented | Mobile equivalent; hat management commands |
 | Direct and MUJI group calls | Call-controls dialog preview | Real media transport, incoming calls, desktop device/portal permissions, mute/camera/speaker, lifecycle and group membership |
-| Contacts and profiles | Live roster and verified direct-chat PEP/vCard avatars with a bounded account disk cache and offline restoration, conversation info following chat/account selection, [server-enforced contact blocking](BLOCKING.md) with direct profile/list actions, cross-resource pushes and acknowledged offline cache, editable profile preview | Avatar publication, local overrides, vCard fields, avatar publication/suggestions, colors and notes |
-| Stories and persistent profile posts | Horizontal chat-list avatar strip and timed native overlay viewer | Correct PEP/Atom access, expiry, persistent saves, edits/retractions, media and profile editing |
+| Contacts and profiles | Live roster and verified direct-chat PEP/vCard avatars with a bounded account disk cache and offline restoration, conversation info following chat/account selection, [server-enforced contact blocking](BLOCKING.md) with direct profile/list actions, cross-resource pushes and acknowledged offline cache, editable profile preview, account-scoped local nickname/notes/avatar overrides with actual-edit revisions across encrypted device sync, and normal-policy image suggestions, and room-member profile cards sharing live room status, display names and avatar providers with the participants pane | Own-avatar publication/accepting suggestions, vCard fields and colors |
+| Stories and persistent profile posts | [Live XEP-0501/Atom stories](STORIES.md), confirmed contact-only PEP access, 24-hour expiry, cached metadata/seen state, recoverable progress/cancel/retry upload, image/animation/video viewing, stable-owner ordinary chat replies, own caption edits/retractions and local own history | Real-contact/server publication acceptance, permanent remote profile saves, viewer receipts, reactions and advanced editing |
 | Notifications | Basic live desktop notifications, opt-in message previews, local chat mute and notification preferences | Actions/attention, mention matching, timed-mute expiry and background behavior |
 | Read state and archives | Focused-chat local unread clearing (including older-history views), immediate send acknowledgement, authenticated own-carbon read synchronization, default-on direct public XEP-0333 receipts with durable opt-out and monotonic read status, retained message widgets, bounded adaptive paging, current screen plus two screens cached on each side, reply jumps and paged direct MAM | Broader cross-client read interoperability, account-wide recovery and room readers |
 | Wallet overview / multiple wallets | Source 3D meshes/GLSL rendered in Rust, precision/QR controls, local add/remove/animated switch and activity fixtures | Production 3D card, secure keyring/SDK integration, unlock/lock, durable wallet slots and removal semantics |
@@ -46,7 +64,7 @@ an in-memory interaction or surface; "planned" means it is still absent.
 | Preferences and appearance | Native live settings for style/emoji, typing, receipts and notification privacy; unsupported switches remain demo-only | Complete settings, themes/icons/layout, accessibility, translation and media/power behavior |
 | Privacy/storage/history | Encrypted OMEMO 2 state; plaintext local chat/draft history; other switches remain previews | Honest cache/history clearing, retention, local encryption and backups as actually supported by Android |
 | Developer/diagnostics/crashes | Discovery/ad-hoc form previews and message-detail dialog | Real disco/commands, sanitized diagnostics, crash handling, version updates and protocol test vectors |
-| Desktop integration | Native window/menu/clipboard, About dialog, pressed reply/reaction feedback, smooth minimal reply navigation, portal-aware chooser, Nix package | Desktop sharing, drag/drop, search, notifications, MPRIS/media keys, accessibility/keyboard acceptance and distribution updates |
+| Desktop integration | Native window/menu/clipboard, Ctrl+V/Shift+Insert from non-text focus into an empty composer while focused editors retain native text paste, dropping files from a file manager onto a conversation stages them as attachments (local regular files only, at most 64, folders refused; `src/drop_files.rs`), About dialog, pressed reply/reaction feedback, smooth minimal reply navigation, focused-window Page Up/Page Down timeline scrolling and End to the actual latest message, portal-aware chooser, Nix package | Desktop sharing, search, notifications, MPRIS/media keys, accessibility/keyboard acceptance and distribution updates |
 
 ## Acceptance rule
 
@@ -62,7 +80,7 @@ feature document considered, including smaller behavior customizations. It is a
 reference inventory; the table above groups them for implementation. Keep both
 updated rather than dropping features because their mobile presentation differs.
 
-Emoji/Stickers use a full-height native virtual section list: combined favorites/recents, installed packs, then built-in categories only for Emoji. Eight-column square emoji cells have equal horizontal/vertical gaps; emoji-only text messages use transparent bubbles, matching mobile TYPE_EMOJIS. Sticker search remains visible and picker panels share padding. Emoji/sticker category controls have matching native positions, insets and spacing; media tabs slide horizontally according to tab order. Loading GIF tiles have square corners. Square mobile-icon selectors scroll to sections; Settings stays fixed outside the horizontal strip and uses one popover surface. Pack previews decode on workers; GIF selection captures the active chat at the click and rejects completion after a chat/account change. Chat-switch/history-scroll responsiveness now uses worker-side caption/link preparation, bounded backend-event draining and at most two new native rows per frame, with pruning/read-state guarded until the batch finishes. The native paging/reply/incoming-update scenario passes; real-workload latency acceptance remains open. Managed joining of the reported room still times out although an isolated raw discovery/join succeeds.
+Emoji/Stickers use a full-height native virtual section list: combined favorites/recents, installed packs, then built-in categories only for Emoji. Eight-column square emoji cells have equal horizontal/vertical gaps; emoji-only text messages use transparent bubbles, matching mobile TYPE_EMOJIS. Sticker search remains visible and picker panels share padding. Emoji/sticker category controls have matching native positions, insets and spacing; media tabs slide horizontally according to tab order. Loading GIF tiles have square corners. Pack category icons use a fixed 24px layout independent of raster/video dimensions, including 512px animated icons; the populated strip remains 30px tall. Square mobile-icon selectors scroll to sections; Settings stays fixed outside the horizontal strip and uses one popover surface. Pack previews decode on workers; GIF selection captures the active chat at the click and rejects completion after a chat/account change. Chat-switch/history-scroll responsiveness now uses worker-side caption/link preparation, bounded backend-event draining and at most two new native rows per frame, with pruning/read-state guarded until the batch finishes. The native paging/reply/incoming-update scenario passes; real-workload latency acceptance remains open. Managed joining now accepts matching multi-resource MUC user items: the reported room confirms membership in 1.14 seconds in the production join path. Conflicting identities/permissions remain rejected. The visible room restores after reconnect and bookmark loading even with autojoin disabled; room history waits for confirmed self presence. Offline native coverage checks the join-to-history transition and immediate feedback.
 
 ## Next milestones
 
@@ -206,3 +224,202 @@ native rows, and sticker worker reaping no longer blocks GTK during eviction.
 See [PERF.md](../PERF.md) for the repeated upward-scroll workload and its limits.
 Phone camera/credential UI and user-workload acceptance still require a phone;
 no attached Android device was available during these checks.
+
+Custom emoji additionally emit/read XEP-0514 spans with hash-verified inline XEP-0447/BoB media, preserving the previous authenticated Legacy envelope grammar. Remote-only emoji sources and empty insertion spans remain unsupported; see [inline emoji](INLINE_EMOJI.md). Mobile picker glyphs are padded to the supplied Telegram reference without shrinking grid hit targets.
+
+2026-11-15 upload recovery: desktop and mobile0.2.215 use one fresh validated
+XEP-0363 slot after transport ambiguity or HTTP409, retaining immutable wire
+bytes and selecting the replacement GET URL. PUT acknowledgement keeps its
+normal30s timeout; only downloads retain the short header reconnect policy.
+Local Android-core and desktop TLS regressions pass. The user confirmed that
+mobile0.2.215 successfully uploads the reported MP4; a temporary progress stall
+around 6.8 MiB remains to be investigated.
+
+Original-quality mobile video selection now preserves the source dimensions, matching desktop's existing original-file path. A non-aligned 854×480 input stays 854×480 instead of silently resizing to 852×480 and forcing a full transcode. Explicit lower-quality selections still resize; mobile sizing regressions and an installed-app reproduction cover the distinction.
+
+
+MUC send preparation accepts promotions/demotions among member/admin/owner between live presence and a fresh complete affiliation list. It still requires the joined send role, private nonanonymous room discovery, all three authenticated lists, own membership, every visible occupant's identity in those lists, and matching membership revision. The reported room now installs its complete 18-member recipient set in 1.33 seconds, without sending a chat message. Incomplete, unidentified, revoked and stale recipient contexts remain blocked; there is no plaintext fallback for an encrypted room. A room the server reports as not members-only and non-anonymous is read from its disco features alone, before any member list is requested. If that room has **never** used encryption (no sticky `encrypted_history`, no encrypted setting, no own encrypted message in memory or the database) it is sent plain with the unencrypted-conversation notice. If it **has** used encryption, the send is refused with an explicit message and nothing is sent, because a server or room admin could otherwise switch a room's flags to downgrade it; the only way to unencrypted is choosing Unencrypted in Conversation Security. A cached plain choice is not trusted for such a room either, and timeouts and refused requests never downgrade a room.
+
+Automatic room fingerprint trust now defaults on in desktop and mobile0.2.217, with an independent account-scoped upgrade for existing rooms. Subsequent opt-outs and blocked fingerprints remain authoritative. Closing Preferences, Shortcuts or another tracked modal resumes focused-chat read tracking; closed dialogs cannot leave a visible group's unread badge stuck.
+
+2026-11-15 desktop follow-up: deletion preserves bottom-following and the first
+surviving viewport anchor. Joined rooms allow automatic visible media downloads,
+reevaluated as membership changes, with existing10MiB/type/integrity/cancellation
+checks. Sticker replies now use the same verified image thumbnail path as mobile
+and sticker previews use a readable label rather than a generatedWebP filename.
+Native deletion anchor tests and download-policy/reply tests cover these paths.
+The unused DeveloperTools preview entry was removed from the hamburger menu.
+
+
+Contact override sync uses per-account/per-contact portable records with actual user-edit revisions, exact-version acknowledgements and explicit null-avatar clears. Nicknames, notes and PNG bytes cross encrypted Device Sync; local paths and remote roster/profile writes do not. Two Android adapter checks, desktop private-store coverage, 19 shared-core checks and a production JNI paired-TLS contact transfer/version fixture pass. Mobile0.2.218 requires the compatible desktop contact-record update.
+
+Desktop native follow-up verification: ManagePacks lists every pack with install,
+edit and order controls; each picker section has its own edit button. Connected
+packs offer explicit local editing instead of disabled actions. Native pointer
+tests cover category-bar drag, manager drag, sticker drag/rename and700-item
+resource bounds (maxGTKgap82ms); high-contrast run passes. Editor toolbar uses
+flat native styling and only one hover background. The text-only Monero tab opens
+the existing interactive 3D wallet card with real synced wallet names and receiving
+addresses; configuration remains in Preferences. Unavailable balances are explicit,
+and account switches remove the old card.
+This does not add desktop wallet spending. Local contact UI and paired transfer
+are documented in [LOCAL_CONTACTS.md](LOCAL_CONTACTS.md). Allreportedfollow-up
+flows have controls and sub400ms feedback checks; actual user-account Stories
+publication and manualphone↔desktop contact editing were not performed.
+
+Both clients keep ordinary files manual: selecting Download opens the native save
+picker before transfer; cancelling it starts no download. Photos, videos, audio and
+stickers retain automatic download policies. Desktop has a native Preferences switch
+and adjustable per-file media limit (default 15 MB); mobile retains its network/type
+policy UI. Explicit sticker-pack downloads still open the existing pack preview.
+Legacy Monocles reply fallback quotes may include a blank separator; desktop now
+accepts that separator like mobile while rejecting nonquote lines inside the range.
+
+Mobile 0.2.221 adds bounded first-attempt body/acknowledgement recovery and
+accepted-object confirmation over HTTPS. The intermittent real-network initial
+stall remains unresolved; desktop real-world reproduction and matching recovery
+behavior require further evidence. Track this explicitly rather than claiming
+that faster retries establish cross-client root-cause parity.
+
+
+Desktop pack-selector artwork now uses looping raster/TGS/WebM playback rather
+than first-frame textures, with offscreen/unmapped playback paused. The native
+WebM pack-bar test verifies a live MediaStream and a 48-sticker grid remains
+responsive (maximum heartbeat gap41ms); offscreen TGS reopen coverage passes.
+The native sync adapter imports mobile-format sticker favorites/recents by
+stable UUID and preserves them in the desktop library. Physical phone↔PC
+favorites/recents transfer is now verified: phone revision1794843209272 imported
+10 favorite stickers and3 recent stickers into the running packaged desktop.
+The booted firewall omitted45950TCP/UDP; restoring those rules unblocked the
+transfer. The permanent Monogram system-module selection still requires system
+activation to survive reboot. No phone control was used after the user asked
+to stop. Desktop wallet scanning/spending remains absent.
+
+
+Android's upload acknowledgement recovery now waits one second after the complete
+wire body is flushed (including closing the output stream), then immediately
+requests a fresh single-use slot for one replay of the same ciphertext. The last
+acknowledgement is bounded to five seconds; final size/header checks can confirm
+either stored object, and failures/certificate/cancellation guards remain. The
+26 core transfer checks pass, including the one-second retry, stream-close wait,
+final deadline, immutable bytes and original-object fallback. Physical AndroidAPI37 acceptance passed: the first upload lost its ACK;
+the fresh-slot retry returned successfully (396ms response phase), with no
+subsequent upload/send failure in the captured interval. Desktop already uses
+fresh slots but still has a30-second
+acknowledgement window and lacks this final stored-object fallback; that narrower
+recovery behavior remains a desktop parity task.
+
+### Pack files (desktop and Android)
+
+Both clients open `.pack` as an alias for the existing XMSP v1 portable archive; `.nzsp` and `.xmsp` remain supported. Opening a downloaded chat attachment or choosing Monogram from the file manager validates/copies the archive on a worker, then opens the existing pack UI with an explicit **Add Pack** action. Previewed packs are initially uninstalled; malformed archives preserve the library, and cancellation/account replacement fences callbacks. This does not add a new wire format. Desktop registers a shared-mime-info type and `%F` activation in Nix, Arch and AppImage packaging. Android accepts dedicated pack MIME types, extension-bearing URIs, and generic ZIP/binary content URIs after checking the provider's display name off-thread. Android requires sign-in and prompts to reopen the file afterward; desktop retains queued files through sign-in.
+
+Verification: 33 Android pack/archive tests (including actual Android intent-filter matching), desktop file classification, and an isolated native GTK cold-library/file-preview/Add Pack/invalid-input check pass. The native flow gives immediate feedback below 400 ms and completes in 1.02 seconds, including a single click that restores a cached chat attachment and opens its pack after download. PR #2's raster cache file I/O and PNG encoding/write/pruning now run on workers; 287 default desktop tests pass. Physical Android file-manager tapping remains untested in this delivery.
+
+### Profile cards, audio playback, invitations and pack sidebar follow-up
+
+Desktop chat-header profiles, message authors/avatars, conversation-info avatars, chat-list avatars and participant rows open a native profile card. It shows cached names/avatars/presence immediately, fetches XEP-0054 vCard fields through the existing authenticated IQ path, and provides Message/local-details actions. Anonymous room participants use their full room/nickname address; no real identity is inferred. The local user uses their known account and public avatar in participant rows/cards, including anonymous rooms; the Saved Messages bookmark remains confined to that conversation. Your Profile now opens the same card. Fields are bounded plain text; external PHOTO URLs are never followed, callbacks are account-fenced, and public details have a bounded five-minute session cache. Mobile retains its native full profile screen and persistent profile cache; desktop's full public-field cache is session-only.
+
+Audio and voice attachments use on-demand native playback with play/pause, seeking, elapsed/remaining time, volume, download progress/cancel and Save As. MP3, Opus/Ogg and the existing binary media containers are supported subject to installed codecs. No automatic playback occurs after automatic downloads. File authentication/first plugin initialization run on workers, cancellation propagates to verification, and another audio playback pauses the previous one. Audio-only streams prepare without waiting for a video frame; text playlists remain rejected and network-source blocking remains in place.
+
+Confirmed server bookmarks with autojoin enabled resolve the matching saved group invitations on both clients, without LAN sync or fingerprint-trust changes. Desktop refreshes open request lists and closes obsolete join dialogs. Failed/cached bookmark loads never dismiss pending invitations. Legacy servers without bookmark notifications converge on the next successful refresh/reconnect.
+
+The sticker category strip explicitly declines vertical expansion. The scrolling surface spans the sidebar, with the previous horizontal padding moved into its rows. Native tests cover invite/account/dialog handling, clickable profile cards and screenshots, compact bar/full-width root, authenticated cached audio UI and real MP3/Opus play/pause/seek, and playlist refusal. Android has a selective/idempotent invitation regression and a fresh 0.2.225 APK. Physical phone interaction was not used.
+
+References: [XEP-0054](https://xmpp.org/extensions/xep-0054.html), [XEP-0402](https://xmpp.org/extensions/xep-0402.html).
+
+Mobile0.2.226 bounds public PNG photos to32KiB and checks complete UTF-8 vCard writes against60KiB before sending; local-only photos keep their separate allowance. Personal/group photo uploads and accepted suggestions share the limit. Acknowledged writes retain cached PEP nicknames without a redundant fetch. Native Android graphics/migration and protocol guards pass14tests. See [mobile profile-photo publication](https://github.com/doromiert/monogram/blob/c1e8ff308/docs/PROFILE_PHOTOS.md). Desktop own-avatar publication/accepting suggestions remains an explicit gap in the table above; physical affected-server acceptance is pending.
+
+Desktop now recognizes mobile’s separate Legacy OMEMO forwarded-attachment placeholder as attachment attribution, including existing history, while retaining original wire rows/IDs and linked outgoing deletion. Media reply cards match ordinary reply insets (13px sides/10px top); attachment-touching bubble edges remain2px, with or without reactions.
+
+Media bubble measurement follows the tile’s natural width plus the bubble’s own insets, so long reply quotes/captions wrap instead of creating blank space beside the media. The size follows changing aspect-ratio metadata; editing retains its full-width behavior. Native long-quote regression covers incoming/outgoing media with reactions.
+
+The matching manual-document/save-picker behavior ships in [Android0.2.227](https://github.com/doromiert/monogram/releases/tag/v0.2.227). Desktop native chooser/cancel/background export checks and Android API36 policy/intent/export tests pass; physical Android provider acceptance remains untested.
+
+### Automatic MUC recipients and nickname completion
+
+Desktop now matches mobile automatic Legacy room encryption when room blind trust is enabled: use established trusted ratchets, retain encrypted device-list discovery caches, and skip unavailable members/devices instead of blocking every recipient. At least one external encrypted target remains required; strict room mode still requires all participants, explicit fingerprint blocks remain excluded, and failed key discovery never causes a plaintext resend. Device-list cache records are encrypted, new successful lists replace removed-device state, and transient timeout fallback is bounded to24 hours with60-second discovery backoff. Existing profiles can seed their first discovery cache from established trusted sessions. Three subsequent user messages were observed as sent with Legacy encryption; no test messages were transmitted.
+
+The desktop composer and inline editor now offer MUC @nickname completion from the current room roster through the same native popover as emoji suggestions. Matching is case insensitive, supports nicknames with spaces and Unicode, excludes the user’s own entry and avoids email-address triggers. Tab/click inserts the chosen nickname, arrows change the selection, Escape closes it, and Enter keeps its send/save behavior. Desktop build passed; UI acceptance is left to the user as requested. This completes nickname text, without claiming new mention-notification or protocol semantics.
+
+Desktop chat switching now retains three bounded recent viewports and presents cold
+loads atomically after scroll placement; native Nautilus-style chat/folder menus
+and keyboard folder selection stay synchronized. See [chat switching](CHAT_SWITCHING.md)
+for scope, limits and measured private GTK verification.
+
+### Voice-message intent (local Android0.2.238 / desktop PR4 integration)
+
+Both clients send/receive the unsubmitted `urn:monogram:voice-message:0` file-metadata marker. Android sends it only for native voice attributes and receives into native voice controls, declared duration and worker-generated waveform. Desktop marks the supplied PR4 recorder's clean sends and retained recordings, persists intent through the outbox and stored SFS descriptions, and uses voice labels/previews with the existing sandboxed audio player. Ordinary imported audio stays ordinary audio; no filename, codec or artist heuristics. See [VOICE.md](VOICE.md).
+
+The marker stays inside authenticated modern encrypted content. Legacy URI-only OMEMO intentionally degrades to ordinary remote audio; it never leaks an unencrypted hint or changes encryption. Shared16-case vectors cover malformed/lookalike/duplicate hints, file binding, protected content, storage and legacy outer-forgery rejection. Independent implementation interoperability, real microphone acceptance and playback speed remain open.
+
+
+### Desktop message click ownership and sender hover
+
+The desktop brush selector arms only on the first primary press in GTK's native
+click sequence. Multi-clicks cancel the pending brush, and starting a brush also
+requires real surface-space pointer movement past GTK's drag threshold. A reply
+or editor changing message geometry during a double-click therefore cannot turn
+into a cross-row selection. Deliberate cross-row dragging and Ctrl/Shift selection
+remain available. Handled double-click sequences also retain ownership of later
+clicks instead of passing them into native label selection. Disabled actions keep
+native text selection.
+
+Message sender profile buttons have a transparent background and underline their
+text on hover or visible keyboard focus. Pango attributes change only decoration;
+button semantics, profile activation, padding and measured message dimensions
+stay intact. Native X11 checks cover the failing second-click drag, repeated
+clicks, incoming reply/outgoing edit, deliberate drag, Ctrl/Shift selection,
+disabled-action text selection, and unchanged hover dimensions/profile activation
+in dark and light themes. This is platform-specific desktop pointer behavior;
+Android's native touch actions and the pending -0 room reply failure are unchanged.
+
+### Legacy correction compatibility
+
+Desktop Legacy OMEMO text editing follows mobile's existing encrypted-body /
+outer XEP-0308 reference path in direct chats and rooms. The standard reference
+uses the original client ID, retained across repeated edits. Room corrections
+use captured author identity, including same-ID messages by different authors;
+stronger protected edits cannot be downgraded. Cached Legacy fallback bodies
+can recover their correction metadata on replay. Legacy media captions remain
+unsupported on both clients. See [message actions](MESSAGE_ACTIONS.md).
+
+
+### Desktop connection and upload feedback (2026-11-25)
+
+Desktop uses native connection toasts for connecting, reconnecting, disconnected
+and recovered states; fatal disconnection offers Reconnect. Replaced states do
+not replay after alerts close. Repeated errors are coalesced for30seconds and
+bounded, sanitized diagnostics make subsequently dismissed failures inspectable.
+The signed-in asynchronous deletion path retains the current viewport, matching
+the earlier demo-path behavior. These are desktop UI fixes; Android retains its
+existing native connection/deletion presentation.
+
+Desktop upload HTTP deadlines now distinguish healthy body transmission from
+waiting for server acknowledgement; see [transfers](FILE_TRANSFERS.md). Android's
+HttpURLConnection transport already has separate body/response recovery and is
+unchanged. Local tests do not establish remote server/network reliability.
+
+
+### HDR media (2026-11-25)
+
+[HDR originals and playback](HDR_MEDIA.md) preserve embedded metadata through
+ordinary encrypted attachments on both clients. Desktop retains precision/CICP
+through decode, thumbnails and video posters, uses the upstream color-managed
+video sink, and reconstructs JPEG gain maps in a hardened helper. Android uses
+native gain-map/HDR bitmap rendering with temporary window ownership, keeps HDR
+photo originals/MIME and avoids needless unedited HDR video conversion. Existing
+editors can produce SDR exports; HDR authoring and physical brightness validation
+remain explicit limits. No unencrypted protocol hints are introduced.
+
+Desktop keyboard additions: Ctrl+E emoji, Ctrl+S stickers, Ctrl+G GIFs, with
+open/switch/close semantics verified from the focused composer. Desktop wallet
+rendering now retains extended reflections in an independently tagged RGBA16F
+texture (see HDR_MEDIA.md); the Android wallet-renderer equivalent and physical
+media-only HDR output remain unverified gaps. No global HDR switch is enabled.
+
+Desktop crypto startup recovery: all3 workers now retry temporary local keyring
+loading failures, without replacing device identities or disabling encryption.
+Classic/Legacy incoming decryption uses loaded local-key availability rather
+than outgoing publication readiness. Private Secret Service stop/restart test
+proves automatic recovery with unchanged pinned identity. Android's separate
+Keystore lifecycle is unchanged; this correction is desktop-specific.

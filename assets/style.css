@@ -33,6 +33,10 @@
 .composer:focus-within { outline-color: alpha(@accent_color,.5); }
 .composer scrolledwindow, .composer textview, .composer textview text { background: transparent; border: none; box-shadow: none; outline: none; }
 .composer scrolledwindow undershoot { background: none; box-shadow: none; }
+/* A scrolled window's minimum height includes its vertical scrollbar's, which made the composer
+   58px tall for one line. Let the content size it instead (see Ui::composer height). */
+.composer scrolledwindow > scrollbar.vertical { min-height: 0; }
+.composer scrolledwindow > scrollbar.vertical > range > trough > slider { min-height: 8px; }
 .composer textview { padding: 0; color: @window_fg_color; }
 .composer textview text { color: @window_fg_color; }
 .send { border-radius: 50%; min-width: 36px; min-height: 36px; padding: 0; }
@@ -50,6 +54,7 @@
 .attachment-preview-art { min-height: 112px; border-radius: 12px; background: alpha(@window_fg_color,.06); }
 .attachment-preview-art picture { border-radius: 12px; }
 .attachment-preview-name { background: alpha(black,.64); border-radius: 9px; color: white; font-size: 11px; font-weight: 600; margin: 6px; padding: 2px 6px; }
+.attachment-preview-position { background: alpha(@accent_bg_color,.92); border-radius: 9px; color: white; font-size: 11px; font-weight: 700; margin: 6px; min-width: 18px; padding: 2px 6px; }
 .attachment-preview-remove { margin: 6px; background: alpha(black,.64); color: white; }
 .poll-answer { background: alpha(@window_fg_color,.05); border-radius: 8px; padding: 6px 8px; min-height: 24px; }
 .poll-answer:checked { background: alpha(@accent_bg_color,.2); }
@@ -60,6 +65,9 @@
 .payment-card { background: linear-gradient(120deg,#ff8a16,#f45100); color: white; border-radius: 12px; padding: 20px 26px; }
 .payment-card .title-1 { color: white; }
 .large-emoji { font-size: 56px; padding: 8px; }
+/* A message that is exactly one emoji. The same size as its Noto animation (about 90 px across in
+   a 96 px box), so the ordinary emoji shown until the first frame arrives does not jump. */
+.single-emoji { font-size: 72px; padding: 0; }
 .preview-label { font-size: 10px; letter-spacing: 1px; opacity: .5; }
 
 .utility-pane stackswitcher button { min-width: 60px; padding: 6px 10px; }
@@ -104,7 +112,7 @@
 .message-list row:selected { background: alpha(@accent_bg_color,.14); color: @window_fg_color; }
 .message-menu > contents { padding: 0; background: transparent; border: none; box-shadow: none; }
 .message-menu-panel { background: @popover_bg_color; border-radius: 12px; padding: 4px; box-shadow: 0 2px 8px alpha(black,.2); }
-.context-menu-row { min-height: 34px; padding: 5px 10px; border-radius: 8px; }
+.context-menu-row { min-height: 24px; padding: 4px 10px; border-radius: 6px; font-weight: normal; }
 .context-menu-row label { margin: 0; }
 .reaction-expand { padding: 0; min-width: 32px; min-height: 32px; border-radius: 999px; }
 .expanded-reactions { padding: 8px 0 0; }
@@ -180,6 +188,7 @@
 
 .message-bubble.media-bubble { padding: 2px; border-radius: 12px; }
 .media-bubble .attachment-controls { padding: 8px; }
+.media-bubble > .message-reply { margin: 8px 11px 10px; }
 .media-bubble .message-author { margin: 3px 7px; }
 .media-viewer .media-controls-top { background: linear-gradient(to bottom, rgba(0,0,0,.5), transparent); padding-bottom: 24px; }
 .media-viewer .media-controls-top headerbar { color: white; }
@@ -221,7 +230,10 @@
 .shared-reaction-bundle .reaction-choice { font-size: 19px; padding: 2px; min-width: 32px; min-height: 32px; border-radius: 999px; }
 
 .message-menu-panel .picker-menu-row { min-height: 20px; padding: 4px 8px; }
-.sticker-sidebar, .gif-library-page { padding: 2px; }
+.gif-library-page { padding: 2px; }
+.sticker-sidebar { padding: 0; }
+.sticker-sidebar .pack-selector { padding: 0 10px; }
+.sticker-sidebar .picker-section-list > row { padding-left: 12px; padding-right: 12px; }
 .message-bubble.emoji-only { background: transparent; border: none; box-shadow: none; padding: 0; }
 .favorite-dragging { opacity: .45; }
 .favorite-drop-target { outline: 2px solid @accent_color; outline-offset: -2px; }
@@ -267,3 +279,71 @@
 .emoji-completion-popover > contents { border-radius: 18px; padding: 6px; }
 .emoji-completion-list { background: transparent; border-radius: 12px; }
 .emoji-completion-list > row { border-radius: 12px; padding: 0; }
+
+.message-editing textview, .message-editing textview text, .message-editing scrolledwindow { background: transparent; color: inherit; box-shadow: none; border: none; }
+.message-editing textview { padding: 2px; }
+
+.picker-section-toggle { padding: 6px 2px; margin-top: 6px; border-radius: 6px; }
+.double-click-preview { padding: 20px; }
+.double-click-preview-bubble { border-radius: 20px; background: alpha(@view_bg_color, .7); border: 1px solid alpha(@view_fg_color,.1); }
+
+.picker-zoom { padding: 0; background: transparent; box-shadow: none; }
+
+.pack-editor-grid { background: transparent; }
+.pack-editor-grid > child { padding: 3px; border-radius: 8px; }
+.pack-editor-grid button.flat { padding: 0; }
+
+.pack-editor-grid > child:hover { background-color: transparent; }
+
+/* Participants panel: availability dot on a participant's avatar. */
+.hat-chip { min-height: 18px; }
+
+/* Voice messages: the recording bar replaces the message box while the microphone button is held. */
+.voice-button, .voice-button > fixed { overflow: visible; }
+.voice-bar { min-height: 36px; padding: 0 4px; }
+/* While recording the whole message box is the accent-coloured bar, with no focus ring. */
+.composer.voice-recording, .composer.voice-recording:focus-within { background-color: @accent_bg_color; color: white; outline-color: transparent; }
+.composer.voice-recording button { color: white; }
+.composer.voice-recording button:hover { background-color: alpha(white, 0.15); }
+.voice-wave { color: white; }
+.voice-timer { font-weight: 600; color: white; }
+.voice-dot { color: white; }
+.voice-hint, .voice-hint.dim-label { color: white; opacity: 0.85; }
+.voice-hint.error { color: white; opacity: 1; font-weight: 600; }
+/* The microphone, carried left while sliding to cancel, becomes white on red. */
+.voice-chip { border-radius: 999px; background-color: transparent; transition: background-color 180ms, box-shadow 180ms, color 180ms; }
+.voice-chip.armed { background-color: @destructive_bg_color; color: white; box-shadow: 0 0 0 7px @destructive_bg_color; }
+.presence-dot { min-width: 12px; min-height: 12px; border-radius: 999px; border: 2px solid @window_bg_color; background: @success_color; }
+.presence-dot.presence-away { background: @warning_color; }
+.presence-dot.presence-busy { background: @error_color; }
+.presence-dot.presence-unknown { background: mix(@window_fg_color, @window_bg_color, .5); }
+
+/* Participants panel: availability dot on a participant's avatar. */
+.presence-dot { min-width: 12px; min-height: 12px; border-radius: 999px; border: 2px solid @window_bg_color; background: @success_color; }
+.presence-dot.presence-away { background: @warning_color; }
+.presence-dot.presence-busy { background: @error_color; }
+.presence-dot.presence-unknown { background: mix(@window_fg_color, @window_bg_color, .5); }
+
+/* Audio messages: a round play button, a waveform and the duration. The button is libadwaita's
+   circular suggested-action, so it follows the accent colour; the waveform takes the same colour. */
+.audio-bubble { min-width: 230px; padding: 2px 0; }
+.audio-bubble .audio-play { min-width: 48px; min-height: 48px; padding: 0; }
+.audio-bubble .audio-wave { color: @accent_color; }
+.audio-bubble .audio-wave:focus-visible { outline: 2px solid @accent_color; outline-offset: 2px; border-radius: 4px; }
+.audio-bubble .audio-time { font-variant-numeric: tabular-nums; }
+
+.profile-target { padding: 0; min-width: 0; min-height: 0; }
+.message-author-target { background: transparent; box-shadow: none; }
+.profile-card-banner { background: color-mix(in srgb, var(--accent-bg-color) 60%, var(--window-bg-color)); border-radius: 6px; }
+
+.profile-card, .profile-card > contents { padding: 0; border: none; background: transparent; box-shadow: none; }
+.profile-card-panel { padding: 8px; border-radius: 14px; background: @popover_bg_color; box-shadow: 0 2px 8px alpha(black,.2); }
+
+.media-upload-status { color: white; background: alpha(black,.65); border-radius: 8px; padding: 2px 6px; font-size: 10px; }
+
+/* A file is being dragged over the conversation. */
+.drop-target {
+  outline: 2px dashed @accent_bg_color;
+  outline-offset: -6px;
+  background-color: alpha(@accent_bg_color, 0.08);
+}

@@ -242,6 +242,12 @@ impl Rooms {
             self.stable_ids.insert(room);
         }
     }
+    /// The room's service discovery advertised XEP-0317, so the hats in its presence are its own.
+    pub fn enable_hats(&mut self, room: String) {
+        if self.known(&room) {
+            self.identities.set_hats(&room, true);
+        }
+    }
     pub fn status(&self, jid: &str) -> Presence {
         let (joined, can_send, detail) = match self.membership.get(jid) {
             Some(Membership::Joined { locked: true, .. }) => {
@@ -309,6 +315,7 @@ impl Rooms {
             }
             return None;
         }
+        bounded(xml).ok()?;
         let user = child(xml, "x", USER).ok().flatten()?;
         if address.resource().is_none()
             || matches!(previous, Membership::Failed(_))
@@ -323,7 +330,7 @@ impl Rooms {
                 .presence(&jid, &address.to_string(), xml, user);
             return None;
         }
-        let item = child(user, "item", USER).ok().flatten();
+        let item = user_item(user).ok()?;
         if item
             .and_then(|value| value.attr("jid"))
             .is_some_and(|real| {
@@ -393,6 +400,9 @@ impl Rooms {
             _ => return None,
         }
         Some(self.status(&jid))
+    }
+    pub fn take_roster_changes(&mut self) -> Vec<(String, Vec<members::Participant>)> {
+        self.identities.take_roster_changes()
     }
     pub fn is_joined(&self, jid: &str) -> bool {
         matches!(self.membership.get(jid), Some(Membership::Joined { .. }))
@@ -535,7 +545,7 @@ impl Rooms {
                 )
             }) {
             let user = child(xml, "x", USER)?.ok_or(Error::Invalid)?;
-            let item = child(user, "item", USER)?.ok_or(Error::Invalid)?;
+            let item = user_item(user)?.ok_or(Error::Invalid)?;
             let real = item
                 .attr("jid")
                 .ok_or(Error::Invalid)?
@@ -599,6 +609,20 @@ impl Rooms {
         Some(message)
     }
 
+    /// Typing needs a joined room occupant, not an OMEMO real-JID disclosure.
+    pub fn typing_sender(&self, xml: &Element) -> Option<(String, String)> {
+        if xml.attr("type") != Some("groupchat") || !addressed_to(xml, &self.owner) {
+            return None;
+        }
+        let sender = xml.attr("from")?.parse::<Jid>().ok()?;
+        let room = sender.to_bare().to_string();
+        let Membership::Joined { occupant, .. } = self.membership.get(&room)? else {
+            return None;
+        };
+        (sender.resource().is_some() && sender != *occupant)
+            .then(|| (room, sender.to_string()))
+    }
+
     pub fn message(&self, xml: &Element) -> Option<(String, Message, bool)> {
         self.decode_message(xml, None)
     }
@@ -628,7 +652,7 @@ impl Rooms {
         let own = if archive.is_some() {
             child(xml, "x", USER)
                 .ok()?
-                .and_then(|user| child(user, "item", USER).ok().flatten())
+                .and_then(|user| user_item(user).ok().flatten())
                 .and_then(|item| item.attr("jid"))
                 .and_then(|real| real.parse::<Jid>().ok())
                 .is_some_and(|real| real.to_bare().as_str() == self.owner)
@@ -645,6 +669,22 @@ impl Rooms {
         let unavailable = xml
             .children()
             .any(|child| child.name() == "encrypted" || child.is("encryption", "urn:xmpp:eme:0"));
+        let action = if unavailable {
+            None
+        } else {
+            crate::message_actions::parse(xml).ok()?.filter(|action| {
+                matches!(action, crate::message_actions::Action::Retract { .. })
+            })
+        };
+        let room_sender = self.sender(xml, archive.is_some()).ok().or_else(|| {
+            own.then(|| members::RoomSender {
+                room: jid.clone(), occupant: address.to_string(), author: self.owner.clone(),
+            })
+        });
+        if action.is_some() && room_sender.is_none() {
+            return None;
+        }
+        let own = own || room_sender.as_ref().is_some_and(|sender| sender.author == self.owner);
         let text = if unavailable {
             "Encrypted room message · this encryption is unavailable on desktop".into()
         } else {
@@ -654,10 +694,10 @@ impl Rooms {
                 _ => return None,
             }
         };
-        let attachment = (!unavailable)
+        let attachment = (!unavailable && action.is_none())
             .then(|| crate::file_share::Attachment::incoming(xml, &text, false))
             .flatten();
-        if (text.trim().is_empty() && attachment.is_none()) || text.len() > 256 * 1024 {
+        if (text.trim().is_empty() && attachment.is_none() && action.is_none()) || text.len() > 256 * 1024 {
             return None;
         }
         let caption = attachment.as_ref().map(|file| file.caption(xml, &text));
@@ -703,7 +743,7 @@ impl Rooms {
         if !wire_id.is_empty() {
             aliases.push(format!("wire:{wire_id}"));
         }
-        if own {
+        {
             if let Some(id) = child(xml, "origin-id", SID)
                 .ok()
                 .flatten()
@@ -720,7 +760,9 @@ impl Rooms {
                 .get_child("file-sharing", crate::file_share::NS)
                 .is_some()
                 || xml.get_child("x", crate::file_share::OOB).is_some(),
-            text,
+            text: if action.is_some() { String::new() } else { text },
+            action,
+            legacy_room_sender: room_sender,
             reply_id,
             reply_to,
             reply,
@@ -795,3 +837,129 @@ impl Rooms {
         Ok(root)
     }
 }
+
+#[cfg(test)]
+mod retraction_tests {
+    use super::*;
+    use crate::{model::Account, message_actions::{self, Action, Event}, storage::Store};
+
+    #[test]
+    fn room_retractions_resolve_archive_ids_and_repair_cached_compatibility_notices() {
+        const OWNER: &str = "owner@example.invalid";
+        const ROOM: &str = "room@conference.example.invalid";
+        let mut rooms = Rooms::new(OWNER.into());
+        rooms.membership.insert(ROOM.into(), Membership::Joined {
+            occupant: format!("{ROOM}/me").parse().unwrap(), can_send: true,
+            locked: false, created: false, owner: false,
+        });
+        rooms.enable_stable_ids(ROOM.into());
+        let xml: Element = format!("<message xmlns='jabber:client' type='groupchat' from='{ROOM}/me' to='{OWNER}' id='original-wire'><body>original</body><stanza-id xmlns='urn:xmpp:sid:0' by='{ROOM}' id='server-original'/><origin-id xmlns='urn:xmpp:sid:0' id='original-origin'/></message>").parse().unwrap();
+        let (_,mut base,_) = rooms.message(&xml).unwrap();
+        base.id = "original".into();
+        base.set_encryption(Mode::Legacy, "trusted-original-key".into());
+        let xml: Element = format!("<message xmlns='jabber:client' type='groupchat' from='{ROOM}/me' to='{OWNER}' id='control-wire'><body>A previous message was retracted.</body><retract xmlns='urn:xmpp:message-retract:1' id='server-original'/><fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:message-retract:1'/><stanza-id xmlns='urn:xmpp:sid:0' by='{ROOM}' id='server-control'/></message>").parse().unwrap();
+        let (_,mut control,_) = rooms.message(&xml).unwrap();
+        control.id = "control".into();
+        assert!(control.text.is_empty());
+        assert!(matches!(&control.action,Some(Action::Retract{target,..}) if target=="server-original"));
+        let db = Store::open(true).unwrap();
+        db.save_account(&Account { jid: OWNER.into(), host: String::new(), port: 5222, direct_tls: false }).unwrap();
+        let chat=crate::model::Chat { jid:ROOM.into(),group:true,..Default::default() };
+        db.save_chat_message(OWNER,&chat,Some(&base)).unwrap();
+        // Simulate history saved by the old room decoder, including its already indexed aliases.
+        db.db.execute("DELETE FROM action_refs WHERE kind='room-archive'", []).unwrap();
+        let mut notice=control.clone();notice.action=None;notice.legacy_room_sender=None;
+        notice.text="A previous message was retracted.".into();db.save_chat_message(OWNER,&chat,Some(&notice)).unwrap();
+        db.record_action(OWNER,ROOM,&control,"received").unwrap();
+        db.reconcile_actions(OWNER,ROOM).unwrap();
+        assert!(db.history(OWNER,ROOM,None,20).is_empty());
+        assert!(db.message(OWNER,ROOM,"control").is_none());
+        for mode in [Mode::Omemo2,Mode::Pq] {
+            let mut protected=base.clone();protected.set_encryption(mode,"protected-key".into());
+            let projected=message_actions::project(vec![protected],vec![Event {row:1,message:control.clone(),failed:false,resolved:None}],OWNER,ROOM);
+            assert!(!projected.messages[0].retracted,"public metadata cannot remove authenticated SCE messages");
+        }
+        let mut other=base.clone();other.own=false;
+        other.legacy_room_sender.as_mut().unwrap().author="friend@example.invalid".into();
+        let mut spoof=control.clone();spoof.own=false;
+        spoof.legacy_room_sender.as_mut().unwrap().author="different@example.invalid".into();
+        let projected=message_actions::project(vec![other],vec![Event {row:1,message:spoof,failed:false,resolved:None}],OWNER,ROOM);
+        assert!(!projected.messages[0].retracted,"one participant cannot retract another participant's message");
+    }
+}
+
+#[cfg(test)]
+mod hats_tests {
+    use super::*;
+
+    const OWNER: &str = "owner@example.invalid";
+    const ROOM: &str = "room@conference.example.invalid";
+
+    fn joined() -> Rooms {
+        let mut rooms = Rooms::new(OWNER.into());
+        rooms.membership.insert(ROOM.into(), Membership::Joined {
+            occupant: format!("{ROOM}/me").parse().unwrap(),
+            can_send: true,
+            locked: false,
+            created: false,
+            owner: false,
+        });
+        rooms.identities.reset(ROOM);
+        rooms
+    }
+    fn presence(rooms: &mut Rooms, nick: &str, extra: &str, own: bool) {
+        let status = if own { "<status code='110'/>" } else { "" };
+        let xml: Element = format!(
+            "<presence xmlns='jabber:client' from='{ROOM}/{nick}' to='{OWNER}'>{extra}<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='participant'/>{status}</x></presence>"
+        )
+        .parse()
+        .unwrap();
+        rooms.presence(&xml);
+    }
+    fn titles(rooms: &mut Rooms, nick: &str) -> Vec<String> {
+        rooms
+            .take_roster_changes()
+            .pop()
+            .and_then(|(_, people)| people.into_iter().find(|p| p.nick == nick))
+            .map(|p| p.hats.into_iter().map(|h| h.title).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn hats_flow_from_presence_to_the_roster_only_for_a_room_that_advertised_them() {
+        let hat = "<hats xmlns='urn:xmpp:hats:0'><hat title='Host' uri='urn:h' hue='200'/></hats>";
+        let mut rooms = joined();
+        presence(&mut rooms, "me", "", true);
+        presence(&mut rooms, "amy", hat, false);
+        assert!(titles(&mut rooms, "amy").is_empty());
+        rooms.enable_hats(ROOM.into());
+        assert_eq!(titles(&mut rooms, "amy"), ["Host"]);
+        // The user's own hats are shown the same way.
+        presence(&mut rooms, "me", hat, true);
+        assert_eq!(titles(&mut rooms, "me"), ["Host"]);
+    }
+
+    #[test]
+    fn a_room_the_client_is_not_in_cannot_switch_hats_on() {
+        let mut rooms = Rooms::new(OWNER.into());
+        rooms.enable_hats("stranger@conference.example.invalid".into());
+        assert!(rooms.identities.take_roster_changes().is_empty());
+        rooms.disconnect();
+        // Leaving or disconnecting forgets the advertisement.
+        let mut rooms = joined();
+        rooms.enable_hats(ROOM.into());
+        rooms.disconnect();
+        rooms.membership.insert(ROOM.into(), Membership::Joined {
+            occupant: format!("{ROOM}/me").parse().unwrap(),
+            can_send: true,
+            locked: false,
+            created: false,
+            owner: false,
+        });
+        rooms.identities.reset(ROOM);
+        presence(&mut rooms, "me", "", true);
+        presence(&mut rooms, "amy", "<hats xmlns='urn:xmpp:hats:0'><hat title='Host' uri='urn:h'/></hats>", false);
+        assert!(titles(&mut rooms, "amy").is_empty());
+    }
+}
+

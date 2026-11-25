@@ -72,6 +72,15 @@ mod snippet_imp {
 }
 glib::wrapper! {pub struct Snippet(ObjectSubclass<snippet_imp::Snippet>) @extends gtk::Widget,@implements gtk::Accessible,gtk::Buildable,gtk::ConstraintTarget;}
 impl Snippet {
+    fn set_source(&self, source: &str) {
+        use gtk::subclass::prelude::*;
+        let preview = crate::components::quote_preview(source);
+        let mut preview: String = preview.chars().take(4096).collect();
+        if source.chars().count() > 4096 { preview.push_str("..."); }
+        self.imp().source.replace(preview);
+        self.imp().width.set(-1);
+        self.queue_resize();
+    }
     pub fn new(source:&str)->Self {
         use gtk::subclass::prelude::*;
         let widget:Self=glib::Object::new();
@@ -90,11 +99,11 @@ fn image(message: &Message) -> Option<Attachment> {
     message
         .attachment
         .as_ref()
-        .filter(|file| file.image_candidate() && !file.sticker)
+        .filter(|file| file.image_candidate())
         .cloned()
 }
 
-pub fn attach(ui: &Rc<Ui>, reply: &Message, row: &gtk::Box) {
+pub fn attach(ui: &Rc<Ui>, reply: &Message, row: &gtk::Grid) {
     if reply.reply_id.is_empty() {
         return;
     }
@@ -107,12 +116,13 @@ pub fn attach(ui: &Rc<Ui>, reply: &Message, row: &gtk::Box) {
     let pending = gtk::Image::from_icon_name("image-x-generic-symbolic");
     pending.set_pixel_size(18);
     slot.add_overlay(&pending);
-    row.append(&slot);
+    row.attach(&slot, 0, 0, 1, 1);
     let (owner, peer) = {
         let state = ui.state.borrow();
         (state.account.clone(), state.current().jid.clone())
     };
     let generation = ui.generation.get();
+    let row = row.downgrade();
     let target = reply.reply_id.clone();
     let author = reply.reply_to.clone();
     let ui = Rc::downgrade(ui);
@@ -142,9 +152,18 @@ pub fn attach(ui: &Rc<Ui>, reply: &Message, row: &gtk::Box) {
         let Some(source) = cached else {
             return;
         };
-        let Some(file) = image(&source) else {
-            return;
-        };
+        if ui.generation.get() != generation
+            || ui.state.borrow().account != owner
+            || ui.state.borrow().current().jid != peer
+        { return; }
+        if !source.retracted && !source.unavailable
+            && let Some(snippet) = row.upgrade().and_then(|r| r.child_at(1, 0))
+                .and_then(|contents| contents.last_child())
+                .and_then(|w| w.downcast::<Snippet>().ok())
+        {
+            snippet.set_source(&source.preview());
+        }
+        let Some(file) = image(&source) else { return; };
         let (Some(slot), Some(picture), Some(pending)) =
             (slot.upgrade(), picture.upgrade(), pending.upgrade())
         else {
@@ -157,8 +176,7 @@ pub fn attach(ui: &Rc<Ui>, reply: &Message, row: &gtk::Box) {
             return;
         }
         slot.set_visible(true);
-        let allow_auto =
-            !ui.smoke && (source.own || source.encrypted || ui.state.borrow().current().contact);
+        let auto_flags = (source.own, source.encrypted);
         let ui = Rc::downgrade(&ui);
         let slot = slot.downgrade();
         let picture = picture.downgrade();
@@ -189,6 +207,7 @@ pub fn attach(ui: &Rc<Ui>, reply: &Message, row: &gtk::Box) {
                 slot.set_visible(false);
                 return glib::ControlFlow::Break;
             }
+            let allow_auto = ui.auto_download_enabled.get() && crate::attachment_ui::automatic_media_allowed(ui.smoke, auto_flags.0, auto_flags.1, state.current());
             drop(state);
             if picture.paintable().is_some() || !ui.in_chat_prefetch(&slot) {
                 return glib::ControlFlow::Continue;
@@ -206,7 +225,7 @@ pub fn attach(ui: &Rc<Ui>, reply: &Message, row: &gtk::Box) {
             } else if allow_auto && ui.in_chat_viewport(&slot) {
                 ui.downloads
                     .borrow_mut()
-                    .start_automatic(&owner, file.clone());
+                    .start_automatic(&owner, file.clone(), if ui.auto_download_enabled.get(){ui.auto_download_limit.get()}else{0});
             }
             glib::ControlFlow::Continue
         };
@@ -242,7 +261,8 @@ mod tests {
         assert!(image(&message).is_none());
         message.formatting = None;
         message.attachment.as_mut().unwrap().sticker = true;
-        assert!(image(&message).is_none());
+        assert!(image(&message).is_some());
+        assert_eq!(message.preview(), "Sticker");
     }
     fn find(widget: &gtk::Widget) -> Option<AspectImage> {
         if widget.has_css_class("reply-image-preview") {
@@ -264,8 +284,10 @@ mod tests {
         let app=adw::Application::builder().application_id("com.negzero.MonogramQuoteWidth").flags(gio::ApplicationFlags::NON_UNIQUE).build();app.register(None::<&gio::Cancellable>).unwrap();
         let css=gtk::CssProvider::new();css.load_from_path(crate::widgets::asset("style.css"));gtk::style_context_add_provider_for_display(&gdk::Display::default().unwrap(),&css,gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         let ui=Ui::new(&app,true);
-        let message=Message{id:"wide-reply".into(),text:"i did".into(),own:true,reply:"ralu · btw install github-cli (as known as gh)\nand let your GPT talk to claude in PR and describe the changes".into(),..Default::default()};
-        ui.state.borrow_mut().current_mut().group=false;ui.state.borrow_mut().current_mut().messages=vec![message];
+        let original=Message{id:"original-quote".into(),author:"ralu".into(),text:"btw install github-cli (as known as gh)\nand let your GPT talk to claude in PR and describe the changes".into(),..Default::default()};
+        let message=Message{id:"wide-reply".into(),text:"i did".into(),own:true,reply:"ralu · btw install github-cli...".into(),reply_id:original.id.clone(),..Default::default()};
+        ui.state.borrow_mut().account.clear();
+        ui.state.borrow_mut().current_mut().group=false;ui.state.borrow_mut().current_mut().messages=vec![original.clone(),message];
         ui.window.set_default_size(1400,800);ui.window.present();ui.render_messages(true);
         let context=glib::MainContext::default();let deadline=Instant::now()+Duration::from_millis(350);while Instant::now()<deadline{context.iteration(false);std::thread::sleep(Duration::from_millis(1));}
         fn quote(widget:&gtk::Widget)->Option<gtk::Label>{if let Some(label)=widget.downcast_ref::<gtk::Label>().filter(|w|w.has_css_class("reply-preview")){return Some(label.clone());}let mut c=widget.first_child();while let Some(w)=c{c=w.next_sibling();if let Some(found)=quote(&w){return Some(found);}}None}
@@ -273,6 +295,8 @@ mod tests {
         eprintln!("Reply quote: text={}px, content={}px, row={}px",snippet.width(),contents.width(),row.width());
         assert!(snippet.width()>=row.width()-2,"Quote left {}px unused",row.width()-snippet.width());
         assert!(snippet.layout().line_count()<=2);
+        assert_eq!(snippet.text(), elide(&snippet, &crate::components::quote_preview(&original.preview()), snippet.width()), "Saved short quotes must be restored from the original before layout");
+        assert!(snippet.text().chars().count()>80, "Quote still cut off at the old character limit");
         assert!(!snippet.text().contains('\n'),"Reply previews should flow across original line breaks, like mobile");
         let ordinary="hello world some fairly ordinary words that should be cut at a whole word instead of halfway through one";
         let clipped=elide(&snippet,ordinary,140);assert!(clipped.ends_with("..."));let prefix=clipped.strip_suffix("...").unwrap();assert!(ordinary[prefix.len()..].starts_with(char::is_whitespace),"Mid-word cut: {clipped}");
@@ -350,7 +374,7 @@ mod tests {
             },
             Message {
                 id: "reply".into(),
-                reply: "You · 📎 image.png".into(),
+                reply: format!("You · 📎 {}...", "longattachmentfilename".repeat(4)),
                 reply_id: "original-image".into(),
                 reply_to: owner.into(),
                 text: "Could be worse".into(),
@@ -369,7 +393,14 @@ mod tests {
                 ..Default::default()
             });
         }
+        let caption_reply = Message {
+            id: "caption-reply".into(),
+            reply: "You · A caption beside a thumbnail must still have room for two lines, including long quotations that need ellipsizing within the card.".into(),
+            text: "Reply to a caption".into(),
+            ..reply.clone()
+        };
         state.current_mut().messages.push(reply);
+        state.current_mut().messages.push(caption_reply);
         ui.store.save(&state).unwrap();
         state.current_mut().messages.remove(0);
         ui.activate_state(state);
@@ -399,6 +430,33 @@ mod tests {
         }
         let picture = find(ui.timeline.upcast_ref()).unwrap();
         assert_eq!((picture.width(), picture.height()), (36, 36));
+        let settle = Instant::now();
+        while settle.elapsed() < Duration::from_millis(150) {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        fn quote(widget: &gtk::Widget) -> Option<gtk::Label> {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>().filter(|l| l.has_css_class("reply-preview")) { return Some(label.clone()); }
+            let mut child = widget.first_child();
+            while let Some(w) = child { child = w.next_sibling(); if let Some(label) = quote(&w) { return Some(label); } }
+            None
+        }
+        let bubble = ui.bubbles.borrow()["reply"].clone();
+        let snippet = quote(&bubble).unwrap();
+        let card = snippet.ancestor(gtk::Button::static_type()).unwrap();
+        let painted = snippet.layout().pixel_size();
+        let bounds = snippet.compute_bounds(&card).unwrap();
+        eprintln!("reply card={}x{}, snippet={}x{}, painted={:?}, origin={},{}",card.width(),card.height(),snippet.width(),snippet.height(),painted,bounds.x(),bounds.y());
+        assert_eq!(snippet.layout().line_count(), 1, "Paperclip and filename must share one line");
+        assert!(snippet.text().starts_with("📎 "));
+        let caption_bubble = ui.bubbles.borrow()["caption-reply"].clone();
+        let caption = quote(&caption_bubble).unwrap();
+        let caption_card = caption.ancestor(gtk::Button::static_type()).unwrap();
+        let caption_bounds = caption.compute_bounds(&caption_card).unwrap();
+        assert_eq!(caption.layout().line_count(), 2, "Text captions retain their two-line preview");
+        assert!(caption_bounds.y() + caption.layout().pixel_size().1 as f32 <= caption_card.height() as f32, "Wrapped caption escapes the card");
+        assert!(painted.1 <= snippet.height(), "Reply text paints below its allocated height");
+        assert!(bounds.y() + painted.1 as f32 <= card.height() as f32, "Reply text escapes the card");
         assert!(gap < Duration::from_millis(400), "UI gap: {gap:?}");
         assert!(
             !ui.state

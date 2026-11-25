@@ -1,6 +1,25 @@
 //! Disposable loopback-only transport checks; launched by xmpp_fixture.py.
 #[path = "../src/lan_sync.rs"]
 mod lan_sync;
+#[path = "../src/emoji_preferences.rs"]
+mod emoji_preferences;
+#[path = "../src/favorite_order_store.rs"]
+mod favorite_order_store;
+#[path = "../src/text_safety.rs"]
+mod text_safety;
+#[path = "../src/last_activity.rs"]
+mod last_activity;
+#[path = "../src/contact_status.rs"]
+mod contact_status;
+#[path = "../src/message_failures.rs"]
+mod message_failures;
+#[path = "../src/profiles.rs"]
+mod profiles;
+mod ui {
+    pub mod favorite_order {
+        pub use crate::favorite_order_store::*;
+    }
+}
 #[path = "../src/monero_settings.rs"]
 mod monero_settings;
 #[path = "../src/chat_states.rs"]
@@ -17,6 +36,8 @@ mod action_store;
 mod avatar;
 #[path = "../src/blocking.rs"]
 mod blocking;
+#[path = "../src/contact_details.rs"]
+mod contact_details;
 #[path = "../src/contact_access.rs"]
 mod contact_access;
 #[path = "../src/credentials.rs"]
@@ -39,6 +60,8 @@ mod iq;
 mod legacy_polls;
 #[path = "../src/legacy_inline.rs"]
 mod legacy_inline;
+#[path = "../src/media_caption.rs"]
+mod media_caption;
 #[path = "../src/media_store.rs"]
 mod media_store;
 #[path = "../src/message_actions.rs"]
@@ -57,6 +80,8 @@ mod read_markers;
 mod rooms;
 #[path = "../src/spoilers.rs"]
 mod spoilers;
+#[path = "../src/stories.rs"]
+mod stories;
 #[path = "../src/storage.rs"]
 mod storage;
 #[path = "../src/transport.rs"]
@@ -212,7 +237,7 @@ fn live_roundtrip() {
     });
     wait(
         &a,
-        |e| matches!(e,BackendEvent::Typing{peer,composing:true} if peer=="bob@localhost"),
+        |e| matches!(e,BackendEvent::Typing{peer,composing:true,..} if peer=="bob@localhost"),
     );
     alice.send(Command::History {
         peer: "bob@localhost".into(),

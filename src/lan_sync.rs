@@ -24,9 +24,30 @@ pub static REVISION: AtomicU64 = AtomicU64::new(0);
 static ADAPTER_STATUS: Mutex<String> = Mutex::new(String::new());
 const KEY_ACCOUNT: &str = "monogram-lan-sync@localhost";
 type Result<T> = std::result::Result<T, String>;
-fn error(_: impl std::fmt::Debug) -> String {
-    "Could not read or save synchronized settings.".into()
+fn error(reason: impl std::fmt::Debug + 'static) -> String {
+    // Types identify the failing layer without logging JSON, keys or passwords.
+    eprintln!("Monogram sync settings operation failed: {}",std::any::type_name_of_val(&reason));
+    user_message(&reason)
 }
+/// The text shown in the sync status row. Only `packs::Error` is expanded: it holds a fixed
+/// `&'static str` (its `From` impls drop io/zip/json sources), so it cannot carry paths, JIDs,
+/// names or JSON. Every other error type may carry user data and stays generic.
+fn user_message(reason: &dyn std::any::Any) -> String {
+    const ADVICE: &str = "Update Monogram on both devices, then retry.";
+    match reason.downcast_ref::<crate::packs::Error>() {
+        Some(pack)=>format!("Could not apply synced settings: {}. {ADVICE}",pack.0.trim_end_matches('.')),
+        None=>format!("Could not apply synced settings. {ADVICE}"),
+    }
+}
+fn keyring_error(reason:crate::credentials::Error)->String {
+    eprintln!("Monogram sync keyring: {reason}");
+    match reason {
+        crate::credentials::Error::Locked=>"Unlock your system keyring or password manager, then try pairing again.",
+        crate::credentials::Error::Unavailable=>"Your system keyring is unavailable. Start and unlock your password manager’s Secret Service, then retry pairing.",
+        _=>"The saved sync key could not be read. Restore its entry in your system keyring, then try again.",
+    }.into()
+}
+fn unicode_wire(value:&str)->String {value.chars().filter(|c|!matches!(c,'\u{fe0f}'|'\u{fe0e}')).collect()}
 fn root() -> PathBuf {
     crate::crypto::lifecycle::root().join("device-sync")
 }
@@ -56,12 +77,10 @@ pub async fn start() -> Result<Arc<Mesh>> {
     }
     let saved = crate::credentials::load_service(KEY_ACCOUNT, "lan-sync-master")
         .await
-        .map_err(error)?;
+        .map_err(keyring_error)?;
     let key = if let Some(saved) = saved {
-        B64.decode(saved.as_bytes())
-            .map_err(error)?
-            .try_into()
-            .map_err(error)?
+        B64.decode(saved.as_bytes()).ok().and_then(|key|key.try_into().ok())
+            .ok_or_else(||"The saved sync key is invalid. Restore its system-keyring entry; existing sync data has been preserved.".to_string())?
     } else {
         let mut key = [0; 32];
         openssl::rand::rand_bytes(&mut key).map_err(error)?;
@@ -71,7 +90,7 @@ pub async fn start() -> Result<Arc<Mesh>> {
             Zeroizing::new(B64.encode(key)),
         )
         .await
-        .map_err(error)?;
+        .map_err(keyring_error)?;
         key
     };
     let mesh = gio::spawn_blocking(move || {
@@ -142,6 +161,14 @@ fn publish_json(mesh: &Mesh, kind: &str, owner: &str, id: &str, value: Value) ->
     store.set_signature(&key, sig)?;
     Ok(())
 }
+fn publish_picker_state(sync:&mut monogram_sync::Store,owner:&str,value:&Value,revision:u64)->Result<()> {
+    let k=key("pack-order",owner,"order");let tracker=format!("picker-user-revision:{owner}");
+    if sync.signature(&tracker).and_then(|s|s.parse::<u64>().ok()).is_some_and(|ack|revision<=ack){return Ok(());}
+    if revision>0||(!sync.state.objects.contains_key(&k)&&!sync.pending().iter().any(|m|m.key()==k)){
+        sync.put_json_at("pack-order",owner,"order",&value.to_string(),revision.max(1))?;
+    }
+    sync.set_signature(&tracker,revision.to_string())?;Ok(())
+}
 async fn cycle(mesh: &Arc<Mesh>, store: &Store) -> Result<()> {
     // Existing local edits publish first; fresh defaults never overwrite a pending import.
     for account in store.accounts() {
@@ -197,23 +224,62 @@ async fn cycle(mesh: &Arc<Mesh>, store: &Store) -> Result<()> {
         }
         let folders = store.pref(&format!("folders:{owner}"), "");
         if !folders.is_empty() {
-            publish_json(
-                mesh,
-                "folders",
-                owner,
-                "folders",
-                serde_json::from_str(&folders).map_err(error)?,
-            )?;
+            let mut value=serde_json::from_str(&folders).map_err(error)?;
+            monogram_sync::profile::normalize_folders(&mut value);
+            publish_json(mesh,"folders",owner,"folders",value)
+                .map_err(|error|format!("Could not sync folders for {owner}: {error}"))?;
+        }
+        for contact in store.load_all_contact_overrides(owner).map_err(error)?.into_values() {
+            let (value,revision)=store.contact_sync_value(owner,&contact.peer).map_err(error)?;
+            let id=crate::contact_details::id(&contact.peer);let tracker=format!("contact-user-revision:{owner}:{id}");
+            let mut sync=mesh.store.lock().unwrap();
+            if sync.signature(&tracker).and_then(|v|v.parse::<u64>().ok()).is_some_and(|ack|revision<=ack){continue;}
+            let k=key("contact",owner,&id);
+            if revision>0 || !sync.state.objects.contains_key(&k){sync.put_json_at("contact",owner,&id,&value.to_string(),revision.max(1))?;}
+            sync.set_signature(&tracker,revision.to_string())?;
         }
         export_fingerprints(mesh, owner)?;
         let library = Library::open(owner).await.map_err(error)?;
-        for pack in library.snapshot().await.map_err(error)?.packs {
-            if pack.items.is_empty() || pack.source.starts_with("local:replaced:") {
-                continue;
-            }
-            let pack = library.sync_tag(pack.id).await.map_err(error)?;
+        let snapshot=library.snapshot().await.map_err(error)?;
+        let mut ready=Vec::new();let mut item_ids=std::collections::HashMap::new();
+        let mut pack_order=json!({"stickers":[],"emojis":[]});
+        for pack in &snapshot.packs {
+            if pack.sync_pending||pack.items.is_empty()||pack.source.starts_with("local:replaced:"){continue;}
+            let pack=library.sync_tag(pack.id).await.map_err(error)?;
+            publish_json(mesh,"pack-meta",owner,&pack.sync_id,pack.sync_metadata())?;
+            if pack.installed{pack_order[if pack.kind==crate::packs::Kind::Emoji{"emojis"}else{"stickers"}].as_array_mut().unwrap().push(json!(pack.sync_id));}
+            for item in &pack.items{item_ids.insert(item.id,(item.sync_id.clone(),pack.kind));}
+            ready.push(pack);
+        }
+        use crate::ui::favorite_order::{self,Kind as FavoriteKind};
+        let preferences=store.emoji_preferences().map_err(error)?;
+        let mut favorites=Vec::new();let mut mixed=preferences.favorites.iter().map(|emoji|(format!("unicode:{}",unicode_wire(emoji)),favorite_order::emoji_key(emoji))).collect::<Vec<_>>();
+        for kind in [crate::packs::Kind::Stickers,crate::packs::Kind::Emoji]{
+            let mut selected=snapshot.favorites.iter().filter_map(|id|item_ids.get(id).filter(|(_,k)|*k==kind).map(|(uuid,_)|(uuid.clone(),favorite_order::pack_key(owner,*id)))).collect::<Vec<_>>();
+            favorite_order::sort_saved(&store.db,if kind==crate::packs::Kind::Emoji{FavoriteKind::Emoji}else{FavoriteKind::Stickers},&mut selected,|v|v.1.clone()).map_err(error)?;
+            for(uuid,key)in selected {favorites.push(uuid.clone());if kind==crate::packs::Kind::Emoji{mixed.push((format!("item:{uuid}"),key));}}
+        }
+        favorite_order::sort_saved(&store.db,FavoriteKind::Emoji,&mut mixed,|v|v.1.clone()).map_err(error)?;
+        pack_order["emoji_favorites"]=json!(mixed.iter().filter_map(|(wire,_)|wire.strip_prefix("unicode:")).collect::<Vec<_>>());
+        pack_order["emoji_favorite_order"]=json!(mixed.iter().map(|v|&v.0).collect::<Vec<_>>());
+        let mut mixed_recent=preferences.recent.iter().map(|emoji|(format!("unicode:{}",unicode_wire(emoji)),favorite_order::emoji_key(emoji))).chain(snapshot.recent.iter().filter_map(|id|item_ids.get(id).filter(|(_,kind)|*kind==crate::packs::Kind::Emoji).map(|(uuid,_)|(format!("item:{uuid}"),favorite_order::pack_key(owner,*id))))).collect::<Vec<_>>();
+        let saved:Vec<String>=serde_json::from_str(&store.pref("picker:recent:emoji","[]")).unwrap_or_default();mixed_recent.sort_by_key(|(_,key)|saved.iter().position(|old|old==key).unwrap_or(usize::MAX));
+        pack_order["emoji_recent"]=json!(mixed_recent.iter().filter_map(|(wire,_)|wire.strip_prefix("unicode:")).collect::<Vec<_>>());
+        pack_order["emoji_recent_order"]=json!(mixed_recent.iter().map(|v|&v.0).collect::<Vec<_>>());
+        pack_order["emoji_pinned"]=json!(preferences.pinned.iter().map(|v|unicode_wire(v)).collect::<Vec<_>>());
+        pack_order["favorites"]=json!(favorites);
+        pack_order["recent"]=json!(snapshot.recent.iter().filter_map(|id|item_ids.get(id).map(|(uuid,_)|uuid)).collect::<Vec<_>>());
+        if snapshot.packs.is_empty(){for field in ["favorites","recent"]{pack_order.as_object_mut().unwrap().remove(field);}}
+        if store.pref("emoji:favorites","").is_empty(){for field in ["emoji_favorites","emoji_favorite_order"]{pack_order.as_object_mut().unwrap().remove(field);}}
+        if store.pref("emoji:pinned","").is_empty(){pack_order.as_object_mut().unwrap().remove("emoji_pinned");}
+        if store.pref("emoji:usage","").is_empty(){for field in ["emoji_recent","emoji_recent_order"]{pack_order.as_object_mut().unwrap().remove(field);}}
+        if !snapshot.packs.iter().any(|p|p.sync_pending){
+            let revision=snapshot.picker_revision.max(store.pref("picker:user-revision","0").parse().unwrap_or(0));
+            publish_picker_state(&mut mesh.store.lock().unwrap(),owner,&pack_order,revision)?;
+        }
+        for pack in ready {
             let mut value = serde_json::to_value(&pack).map_err(error)?;
-            for field in ["last_sync", "last_attempt", "sync_error"] {
+            for field in ["last_sync", "last_attempt", "sync_error", "sync_pending"] {
                 value.as_object_mut().unwrap().remove(field);
             }
             let sig = digest(&serde_json::to_vec(&value).map_err(error)?);
@@ -247,6 +313,7 @@ async fn cycle(mesh: &Arc<Mesh>, store: &Store) -> Result<()> {
             result?;
             mesh.store.lock().unwrap().set_signature(&k, sig)?;
         }
+
     }
     let pending = mesh.store.lock().unwrap().pending();
     for meta in pending {
@@ -261,18 +328,22 @@ async fn cycle(mesh: &Arc<Mesh>, store: &Store) -> Result<()> {
         let applied = apply(store, &meta, &path).await;
         let _ = std::fs::remove_file(path);
         match applied {
-            Ok(signature) => {
+            Ok(Some(signature)) => {
+                let picker_revision=if meta.kind=="pack-order" {Some(Library::open(&meta.owner).await.map_err(error)?.snapshot().await.map_err(error)?.picker_revision.max(store.pref("picker:user-revision","0").parse().unwrap_or(0)))}else{None};
                 let mut sync = mesh.store.lock().unwrap();
-                sync.mark_applied(&meta.key(), &meta.digest)?;
+                if matches!(meta.kind.as_str(),"pack-order"|"contact") {if !sync.mark_applied_meta(&meta)?{continue;}}else{sync.mark_applied(&meta.key(), &meta.digest)?;}
                 sync.set_signature(&meta.key(), signature)?;
+                if meta.kind=="contact" {sync.set_signature(&format!("contact-user-revision:{}:{}",meta.owner,meta.id),meta.stamp.to_string())?;}
+                if let Some(revision)=picker_revision.filter(|revision|*revision<=meta.stamp){sync.set_signature(&format!("picker-user-revision:{}",meta.owner),revision.to_string())?;}
                 REVISION.fetch_add(1, Ordering::Relaxed);
             }
+            Ok(None) => continue,
             Err(reason) => return Err(reason),
         }
     }
     Ok(())
 }
-async fn apply(store: &Store, meta: &Meta, path: &std::path::Path) -> Result<String> {
+async fn apply(store: &Store, meta: &Meta, path: &std::path::Path) -> Result<Option<String>> {
     if meta.kind == "pack" {
         if !store.accounts().iter().any(|a| a.jid == meta.owner) {
             return Err("Waiting for the pack’s account to sync.".into());
@@ -283,10 +354,10 @@ async fn apply(store: &Store, meta: &Meta, path: &std::path::Path) -> Result<Str
             .await
             .map_err(error)?;
         let mut value = serde_json::to_value(pack).map_err(error)?;
-        for field in ["last_sync", "last_attempt", "sync_error"] {
+        for field in ["last_sync", "last_attempt", "sync_error", "sync_pending"] {
             value.as_object_mut().unwrap().remove(field);
         }
-        return Ok(digest(&serde_json::to_vec(&value).map_err(error)?));
+        return Ok(Some(digest(&serde_json::to_vec(&value).map_err(error)?)));
     }
     let data = Zeroizing::new(std::fs::read(path).map_err(error)?);
     let value: Value = serde_json::from_slice(&data).map_err(error)?;
@@ -295,6 +366,9 @@ async fn apply(store: &Store, meta: &Meta, path: &std::path::Path) -> Result<Str
         return Err("Invalid synchronized account.".into());
     }
     match meta.kind.as_str() {
+        "contact" => {
+            if !store.apply_contact_sync(&meta.owner,&value,meta.stamp).map_err(error)? {return Ok(None);}
+        },
         "account" => {
             let account = Account {
                 jid: meta.owner.clone(),
@@ -342,6 +416,29 @@ async fn apply(store: &Store, meta: &Meta, path: &std::path::Path) -> Result<Str
                 )
                 .map_err(error)?;
         }
+        "pack-meta" => {
+            if !store.accounts().iter().any(|a|a.jid==meta.owner){return Ok(None);}
+            Library::open(&meta.owner).await.map_err(error)?.apply_sync_metadata(value.clone()).await.map_err(error)?;
+        }
+        "pack-order" => {
+            let library=Library::open(&meta.owner).await.map_err(error)?;
+            let local_revision=library.snapshot().await.map_err(error)?.picker_revision.max(store.pref("picker:user-revision","0").parse().unwrap_or(0));
+            eprintln!("Monogram picker sync received remote={} local={} favorites={} recent={}",meta.stamp,local_revision,value["favorites"].as_array().map_or(0,Vec::len),value["recent"].as_array().map_or(0,Vec::len));
+            if local_revision>meta.stamp{return Ok(Some(digest(&serde_json::to_vec(&value).map_err(error)?)));}
+            let observed=store.pref("picker:observed-revision","0").parse::<u64>().unwrap_or(0).max(meta.stamp);store.set_pref("picker:observed-revision",&observed.to_string()).map_err(error)?;
+            if !library.apply_sync_order_at(value.clone(),Some(meta.stamp)).await.map_err(error)? {eprintln!("Monogram picker sync waiting for referenced pack items");return Ok(None);}
+            let snapshot=library.snapshot().await.map_err(error)?;
+            let local_keys=|field:&str|->Option<Vec<String>>{value.get(field)?.as_array()?.iter().map(|key|{let key=key.as_str()?;if let Some(emoji)=key.strip_prefix("unicode:"){Some(crate::ui::favorite_order::emoji_key(emoji))}else{let id=key.strip_prefix("item:")?;snapshot.packs.iter().flat_map(|p|p.items.iter()).find(|item|item.sync_id==id).map(|item|crate::ui::favorite_order::pack_key(&meta.owner,item.id))}}).collect()};
+            for field in ["emoji_favorite_order","emoji_recent_order"]{if value.get(field).is_some()&&local_keys(field).is_none(){return Ok(None);}}
+            if !store.import_synced_emoji_preferences_at(&value,Some(meta.stamp)).map_err(error)?{return Ok(None);}
+            if let Some(keys)=local_keys("emoji_favorite_order"){if !crate::ui::favorite_order::import_synced_order_at(&store.db,crate::ui::favorite_order::Kind::Emoji,&meta.owner,keys,Some(meta.stamp)).map_err(error)?{return Ok(None);}}
+            if let Some(keys)=local_keys("emoji_recent_order"){if !store.import_picker_recent_order(&keys,meta.stamp).map_err(error)?{return Ok(None);}}
+            if value.get("favorites").is_some(){let keys=snapshot.favorites.iter().filter(|id|snapshot.packs.iter().any(|p|p.kind==crate::packs::Kind::Stickers&&p.items.iter().any(|i|i.id==**id))).map(|id|crate::ui::favorite_order::pack_key(&meta.owner,*id)).collect();if !crate::ui::favorite_order::import_synced_order_at(&store.db,crate::ui::favorite_order::Kind::Stickers,&meta.owner,keys,Some(meta.stamp)).map_err(error)?{return Ok(None);}}
+            library.observe_picker_revision(meta.stamp).await.map_err(error)?;
+            let observed=store.pref("picker:observed-revision","0").parse::<u64>().unwrap_or(0).max(meta.stamp);store.set_pref("picker:observed-revision",&observed.to_string()).map_err(error)?;
+
+
+        }
         "folders" => {
             store
                 .set_pref(&format!("folders:{}", meta.owner), &value.to_string())
@@ -367,7 +464,7 @@ async fn apply(store: &Store, meta: &Meta, path: &std::path::Path) -> Result<Str
         }
         _ => return Err("Unsupported synchronized setting.".into()),
     }
-    Ok(digest(&serde_json::to_vec(&value).map_err(error)?))
+    Ok(Some(digest(&serde_json::to_vec(&value).map_err(error)?)))
 }
 fn export_fingerprints(mesh: &Mesh, owner: &str) -> Result<()> {
     let root = crate::crypto::lifecycle::root()
@@ -435,6 +532,46 @@ pub fn public_records(store: &Store, prefix: &str) -> Vec<Value> {
 #[cfg(test)]
 mod native_tests {
     use super::*;
+    const GENERIC: &str = "Could not apply synced settings. Update Monogram on both devices, then retry.";
+    #[test]
+    fn pack_error_reason_is_shown_to_the_user() {
+        let text=user_message(&crate::packs::Error("Invalid pack artwork metadata."));
+        assert_eq!(text,"Could not apply synced settings: Invalid pack artwork metadata. Update Monogram on both devices, then retry.");
+        assert!(!text.contains(".."));
+        // Messages without a trailing period read the same way.
+        assert!(user_message(&crate::packs::Error("Invalid pack metadata identity")).contains("identity. Update"));
+    }
+    #[test]
+    fn non_pack_errors_never_leak_their_content() {
+        let secret="fictional-sync-password";
+        let json=serde_json::from_str::<Value>(&format!("{{\"password\":\"{secret}\" nope")).unwrap_err();
+        let io=std::io::Error::new(std::io::ErrorKind::NotFound,format!("/home/fictional/{secret}"));
+        for text in [user_message(&secret.to_string()),user_message(&json),user_message(&io),user_message(&format!("{secret}@example.invalid"))] {
+            assert_eq!(text,GENERIC);
+            assert!(!text.contains(secret)&&!text.contains("/home/")&&!text.contains("example.invalid"));
+        }
+        // The same holds through the real entry point used by every call site.
+        assert_eq!(error(secret.to_string()),GENERIC);
+    }
+    #[test]
+    fn pack_io_errors_are_already_sanitised() {
+        let io=std::io::Error::new(std::io::ErrorKind::PermissionDenied,"/home/fictional/secret-pack.png");
+        let text=user_message(&crate::packs::Error::from(io));
+        assert!(text.contains("Pack file could not be read or saved"));
+        assert!(!text.contains("fictional")&&!text.contains("/home/"));
+    }
+    #[test]
+    fn picker_export_uses_user_revision_not_export_time_or_payload_drift(){
+        let path=std::env::temp_dir().join(format!("picker-revision-{}",uuid::Uuid::new_v4()));let owner="version@fixture.invalid";
+        let mut sync=monogram_sync::Store::open(path.clone(),[42;32],"Fixture".into()).unwrap();
+        let mobile=json!({"stickers":[],"emojis":[],"emoji_favorites":["🔥"]});let stale=json!({"stickers":[],"emojis":[],"emoji_favorites":["❤️"]});let k=key("pack-order",owner,"order");
+        let first=sync.put_json_at("pack-order",owner,"order",&mobile.to_string(),200).unwrap();
+        publish_picker_state(&mut sync,owner,&stale,0).unwrap();assert_eq!(sync.state.objects[&k],first,"startup overwrote remote state");
+        sync.set_signature(&format!("picker-user-revision:{owner}"),"200".into()).unwrap();publish_picker_state(&mut sync,owner,&stale,200).unwrap();assert_eq!(sync.state.objects[&k],first,"import normalization re-published state");
+        publish_picker_state(&mut sync,owner,&stale,150).unwrap();assert_eq!(sync.state.objects[&k],first,"late export overrode newer user change");
+        publish_picker_state(&mut sync,owner,&stale,201).unwrap();assert_eq!(sync.state.objects[&k].stamp,201);assert_ne!(sync.state.objects[&k].digest,first.digest);
+        drop(sync);let mut sync=monogram_sync::Store::open(path.clone(),[42;32],"Restart".into()).unwrap();let final_meta=sync.state.objects[&k].clone();publish_picker_state(&mut sync,owner,&mobile,201).unwrap();assert_eq!(sync.state.objects[&k],final_meta,"restart treated local drift as edit");drop(sync);std::fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     #[ignore = "requires isolated Secret Service"]
     fn native_stores_and_restart_keep_credentials_and_folder_updates() {
@@ -448,6 +585,23 @@ mod native_tests {
             meta.kind="token".into();meta.id="giphy".into();std::fs::write(&path,json!({"value":"fictional-api-key"}).to_string()).unwrap();apply(&store,&meta,&path).await.unwrap();assert_eq!(crate::credentials::load_service(owner,"giphy").await.unwrap().unwrap().as_str(),"fictional-api-key");
             let old=store.load_windowed(owner);let folders=json!({"rules":{"Friends":{"types":["contacts"],"exclude_muted":false,"exclude_read":false,"exclude_archived":true,"include":[],"exclude":[],"icon":"cat","pinned":[]}},"order":["Friends","All"],"all_hidden":true});
             meta.kind="folders".into();meta.id="folders".into();std::fs::write(&path,folders.to_string()).unwrap();apply(&store,&meta,&path).await.unwrap();store.save_chat_state(&old).unwrap();let reloaded=store.load_windowed(owner);assert!(reloaded.all_folder_hidden);assert_eq!(reloaded.folders["Friends"].icon,"cat");
+            let library_state=json!({"emojis":[],"stickers":[],"favorites":[],"recent":[],"emoji_favorites":["☠","❤"],"emoji_recent":["🐢","😂"],"emoji_favorite_order":["unicode:☠","unicode:❤"],"emoji_recent_order":["unicode:🐢","unicode:😂"]});
+            meta.kind="pack-order".into();meta.id="order".into();std::fs::write(&path,library_state.to_string()).unwrap();assert!(apply(&store,&meta,&path).await.unwrap().is_some());
+            let preferences=store.emoji_preferences().unwrap();assert_eq!(preferences.favorites,["☠","❤️"]);assert_eq!(preferences.recent,["🐢","😂"]);assert!(store.pref("picker:recent:emoji","").contains("emoji:🐢"));
+            // Mobile exports stable UUIDs; desktop resolves them to its own local IDs.
+            let library = Library::open(owner).await.unwrap();
+            let archive = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/device-sync/mobile.xmsp");
+            let pack = library.import_sync_xmsp(archive, Job::new(), "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()).await.unwrap();
+            let item = &pack.items[0];
+            let mut mobile_order = library_state.clone();
+            mobile_order["favorites"] = json!([item.sync_id]);
+            mobile_order["recent"] = json!([item.sync_id]);
+            meta.stamp = 2;
+            std::fs::write(&path, mobile_order.to_string()).unwrap();
+            assert!(apply(&store, &meta, &path).await.unwrap().is_some());
+            let received = library.snapshot().await.unwrap();
+            assert_eq!(received.favorites, [item.id]);
+            assert_eq!(received.recent, [item.id]);
             store.forget(owner).unwrap();meta.kind="account".into();meta.id="login".into();std::fs::write(&path,account.to_string()).unwrap();assert!(apply(&store,&meta,&path).await.is_err());assert!(store.accounts().is_empty());
             let first=start().await.unwrap();let id=first.store.lock().unwrap().state.id.clone();stop();drop(first);gtk::glib::timeout_future(Duration::from_millis(800)).await;
             let again=start().await.unwrap();assert_eq!(again.store.lock().unwrap().state.id,id);stop();drop(again);

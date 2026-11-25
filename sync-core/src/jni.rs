@@ -183,6 +183,34 @@ pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_putJson(
     })
 }
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_putJsonAt(
+    mut env: JNIEnv,
+    _class: JClass,
+    id: jlong,
+    kind: JString,
+    owner: JString,
+    item: JString,
+    json: JString,
+    stamp: jlong,
+) -> jstring {
+    call(&mut env, |env| {
+        let (kind, owner, item, value) = (
+            string(env, kind)?,
+            string(env, owner)?,
+            string(env, item)?,
+            string(env, json)?,
+        );
+        let stamp=u64::try_from(stamp).map_err(|_|"Invalid picker edit revision.")?;
+        let mesh = handle(id)?;
+        let meta = mesh
+            .store
+            .lock()
+            .map_err(failure)?
+            .put_json_at(&kind, &owner, &item, &value,stamp)?;
+        text(env, serde_json::to_string(&meta).map_err(failure)?)
+    })
+}
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_read(
     mut env: JNIEnv,
     _class: JClass,
@@ -198,6 +226,10 @@ pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_read(
             path.to_str().ok_or("Invalid private sync path.")?.into(),
         )
     })
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_appliedVersion(mut env:JNIEnv,_class:JClass,id:jlong,meta:JString)->jboolean{
+    call(&mut env,|env|{let meta:crate::storage::Meta=serde_json::from_str(&string(env,meta)?).map_err(failure)?;let changed=handle(id)?.store.lock().map_err(failure)?.mark_applied_meta(&meta)?;Ok(u8::from(changed))})
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_applied(
@@ -335,5 +367,26 @@ pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_joinNumeric(
     call(&mut env, |env| {
         let (peer, code) = (string(env, peer)?, string(env, code)?);
         text(env, handle(id)?.join_numeric(&peer, &code)?)
+    })
+}
+
+/// Token-bound local pairing controls; existing JNI entry points remain compatible.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_negzero_monogram_sync_NativeMesh_pairing(
+    mut env:JNIEnv,_class:JClass,id:jlong,action:JString,token:jlong,value:JString,
+)->jstring {
+    call(&mut env,|env| {
+        let mesh=handle(id)?;let action=string(env,action)?;let value=string(env,value)?;
+        if token<0 || value.len()>8192{return Err("Invalid pairing operation.".into());}
+        let result=match action.as_str(){
+            "token"=>mesh.pairing_token().to_string(),
+            "invalidate"=>mesh.invalidate_pairing().to_string(),
+            "cancel"=>{mesh.finish_cancel_pairing(token as u64);String::new()},
+            "invite"=>mesh.invite_for(token as u64)?,
+            "numeric"=>mesh.numeric_invite_for(token as u64)?.to_string(),
+            "join"=>mesh.join_for(&value,token as u64)?,
+            "joinNumeric"=>{let v:serde_json::Value=serde_json::from_str(&value).map_err(failure)?;mesh.join_numeric_for(v["id"].as_str().ok_or("Invalid pairing device.")?,v["code"].as_str().ok_or("Invalid pairing code.")?,token as u64)?},
+            _=>return Err("Unknown pairing operation.".into()),
+        };text(env,result)
     })
 }

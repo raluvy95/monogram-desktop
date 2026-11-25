@@ -14,12 +14,12 @@ pkgdesc='Native GTK/libadwaita Monogram XMPP client'
 arch=('x86_64' 'aarch64')
 url='https://github.com/doromiert/monogram-desktop'
 license=('GPL-3.0-or-later' 'GPL-3.0-only' 'AGPL-3.0-only' 'LGPL-2.1-or-later' 'NAPL-1.1')
-depends=('gtk4>=1:4.20' 'libadwaita>=1:1.9' 'glycin-gtk4>=2.1' 'glycin'
+depends=('gtk4>=1:4.20' 'libadwaita>=1:1.9' 'glycin-gtk4>=2.1' 'glycin' 'libultrahdr'
          'libclapper-gtk>=0.10' 'gst-plugins-base' 'gst-plugins-good' 'gst-plugins-bad'
-         'gst-plugins-ugly' 'gst-libav' 'libepoxy' 'openssl' 'sqlite' 'protobuf-c'
+         'gst-plugins-ugly' 'gst-libav' 'gst-plugin-gtk4' 'libepoxy' 'openssl' 'sqlite' 'protobuf-c'
          'bubblewrap' 'fontconfig' 'ttf-dejavu' 'noto-fonts-emoji' 'pangomm-2.48' 'cairomm-1.16' 'tinyxml2')
 makedepends=('git' 'rust' 'cargo' 'pkgconf' 'protobuf' 'cmake' 'ninja' 'glib2-devel')
-optdepends=('keepassxc: fill and save XMPP passwords' 'gnome-keyring: Secret Service provider (or another compatible keyring)')
+optdepends=('keepassxc: fill and save XMPP passwords' 'xdg-desktop-portal: ask for permission to use the camera' 'gst-plugin-pipewire: take photos with the camera' 'gnome-keyring: Secret Service provider (or another compatible keyring)')
 provides=('monogram-desktop')
 conflicts=('monogram-desktop')
 options=('!lto')
@@ -57,7 +57,7 @@ build() {
     cmake --build "$srcdir/math-build"
     export PKG_CONFIG_PATH="$srcdir/native/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export MONOGRAM_BWRAP=/usr/bin/bwrap MONOGRAM_MATH_HELPER=/usr/lib/monogram-desktop/monogram-math-renderer
-    cargo build --release --frozen --bin monogram-desktop --bin monogram-sticker-renderer
+    cargo build --release --frozen --bin monogram-desktop --bin monogram-sticker-renderer --bin monogram-media-author --bin monogram-audio-preview
 }
 
 check() {
@@ -71,12 +71,15 @@ package() {
     cd "$srcdir/monogram-desktop"
     install -Dm755 target/release/monogram-desktop "$pkgdir/usr/lib/monogram-desktop/monogram-desktop"
     install -Dm755 target/release/monogram-sticker-renderer "$pkgdir/usr/lib/monogram-desktop/monogram-sticker-renderer"
+    install -Dm755 target/release/monogram-media-author "$pkgdir/usr/lib/monogram-desktop/monogram-media-author"
+    install -Dm755 target/release/monogram-audio-preview "$pkgdir/usr/lib/monogram-desktop/monogram-audio-preview"
     install -Dm755 "$srcdir/math-build/monogram-math-renderer" "$pkgdir/usr/lib/monogram-desktop/monogram-math-renderer"
     install -d "$pkgdir/usr/share/monogram-math"
     cp -a "$srcdir/MicroTeX-$_microtex_rev/res/." "$pkgdir/usr/share/monogram-math/"
     install -Dm755 packaging/monogram-desktop "$pkgdir/usr/bin/monogram-desktop"
     install -d "$pkgdir/usr/share/monogram-desktop" "$pkgdir/usr/share/licenses/$pkgname"
     cp -a assets/. "$pkgdir/usr/share/monogram-desktop/"
+    install -Dm644 data/com.negzero.MonogramDesktop.xml "$pkgdir/usr/share/mime/packages/com.negzero.MonogramDesktop.xml"
     install -Dm644 data/com.negzero.MonogramDesktop.desktop "$pkgdir/usr/share/applications/com.negzero.MonogramDesktop.desktop"
     install -Dm644 data/icons/com.negzero.MonogramDesktop.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.negzero.MonogramDesktop.svg"
     cp -a LICENSE LICENSES "$pkgdir/usr/share/licenses/$pkgname/"

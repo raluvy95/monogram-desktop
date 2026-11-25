@@ -1,6 +1,8 @@
 use crate::model::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+#[path = "stories_store.rs"]
+mod stories_store;
 #[path = "request_store.rs"]
 mod request_store;
 #[path = "rooms/store.rs"]
@@ -90,7 +92,10 @@ impl Store {
         store.init_rooms()?;
         store.init_requests()?;
         store.init_read_markers()?;
+        store.init_stories()?;
+        store.init_contact_details()?;
         store.init_link_previews()?;
+        store.init_message_failures()?;
         for account in store.accounts(){store.migrate_chat_defaults(&account.jid)?;}
         store.db.execute_batch("CREATE INDEX IF NOT EXISTS queued_outbox ON messages(account,timestamp,id) WHERE json_extract(body,'$.outbox_pending')=1;")?;
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS upload_captions(account TEXT NOT NULL,peer TEXT NOT NULL,id TEXT NOT NULL,parent TEXT NOT NULL,PRIMARY KEY(account,peer,id),FOREIGN KEY(account,peer,id) REFERENCES messages(account,peer,id) ON DELETE CASCADE);CREATE INDEX IF NOT EXISTS upload_caption_parent ON upload_captions(account,peer,parent);")?;
@@ -143,10 +148,9 @@ impl Store {
             )
             .optional()
             .map(|value| value.unwrap_or_else(|| {
-                // Direct conversations default to blind trust; rooms retain their
-                // separate opt-in, and explicit contact choices remain authoritative.
+                // Both direct chats and rooms default to automatic fingerprint trust.
+                // Explicit choices after the one-time upgrade remain authoritative.
                 !owner.is_empty() && crate::protocol::bare(peer).is_ok()
-                    && !self.db.query_row("SELECT COALESCE(json_extract(body,'$.group'),0) FROM chats WHERE account=? AND peer=?",params![owner,peer],|r|r.get::<_,bool>(0)).unwrap_or(false)
             }))
     }
     pub(crate) fn blind_trust_for(
@@ -282,6 +286,7 @@ impl Store {
                 params![account, peer, m.id],
             )?;
         }
+        self.recover_forwarded_attachment(account, peer, m)?;
         Ok(())
     }
     pub fn ready_upload_captions(&self, owner: &str) -> rusqlite::Result<Vec<(String, Message)>> {
@@ -442,21 +447,15 @@ impl Store {
         id: &str,
         reply: crate::crypto::legacy::service::LegacyReply,
     ) -> rusqlite::Result<()> {
-        let original = if reply.quote.is_empty() {
-            reply.text.clone()
-        } else {
-            format!("> {}\n{}", reply.quote.replace('\n', "\n> "), reply.text)
-        };
-        if !self.message(account, peer, id).is_some_and(|m| {
-            m.mode() == crate::encryption_policy::Mode::Legacy
-                && !m.retracted
-                && !m.unavailable
-                && !m.edited
-                && m.reply_id.is_empty()
-                && m.text == original
-        }) {
-            return Ok(());
-        }
+        let original=reply.original.clone();
+        let Some(message)=self.message(account,peer,id).filter(|m| {
+            m.mode()==crate::encryption_policy::Mode::Legacy && !m.retracted && !m.unavailable && !m.edited
+                && (m.reply_id.is_empty() || m.reply_id==reply.id && (m.reply_to.is_empty() || m.reply_to==reply.to))
+                && m.text==original
+        })else{return Ok(());};
+        let removed=[(0,original.chars().count().saturating_sub(reply.text.chars().count()))];
+        let formatting=message.formatting.as_ref().and_then(|m|m.without(&removed)).filter(|m|m.body==reply.text);
+        let inline=message.inline_emoji.as_ref().and_then(|m|m.without(&removed).ok()).filter(|m|m.body==reply.text);
         let quote = self
             .resolve_reply(account, peer, &reply.to, &reply.id)
             .filter(|target| !target.retracted)
@@ -465,11 +464,20 @@ impl Store {
         let tx = self.db.unchecked_transaction()?;
         for table in ["messages", "message_bases"] {
             tx.execute(
-                &format!("UPDATE {table} SET body=json_set(body,'$.reply_id',?1,'$.reply_to',?2,'$.reply',?3,'$.text',?4) WHERE account=?5 AND peer=?6 AND id=?7 AND json_extract(body,'$.text')=?8 AND COALESCE(json_extract(body,'$.retracted'),0)=0"),
-                params![reply.id, reply.to, quote, reply.text, account, peer, id, original],
+                &format!("UPDATE {table} SET body=json_set(body,'$.reply_id',?1,'$.reply_to',?2,'$.reply',?3,'$.text',?4,'$.formatting',json(?9),'$.inline_emoji',json(?10)) WHERE account=?5 AND peer=?6 AND id=?7 AND json_extract(body,'$.text')=?8 AND COALESCE(json_extract(body,'$.retracted'),0)=0"),
+                params![reply.id, reply.to, quote, reply.text, account, peer, id, original,serde_json::to_string(&formatting).unwrap(),serde_json::to_string(&inline).unwrap()],
             )?;
         }
         tx.commit()
+    }
+    /// Whether this account ever sent an encrypted message to `peer` (a database check for chats
+    /// whose history predates the sticky `encrypted_history` flag).
+    pub fn sent_encrypted(&self, account: &str, peer: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE account=?1 AND peer=?2 AND json_extract(body,'$.own')=1 AND json_extract(body,'$.encrypted')=1)",
+            rusqlite::params![account, peer],
+            |row| row.get(0),
+        )
     }
     pub fn update_delivery(
         &self,
@@ -489,10 +497,59 @@ impl Store {
         };
         if message.delivery != "read" && (message.delivery != "delivered" || status == "read") {
             message.delivery = status.into();
+            if !matches!(status, "failed" | "uncertain") {
+                message.failure_reason.clear();
+            }
             let tx = self.db.unchecked_transaction()?;
             self.upsert_message(account, peer, &message)?;
             tx.commit()?;
         }
+        Ok(Some(message))
+    }
+    /// Record why the own message `wire` failed, for Message Details.
+    pub fn record_failure(
+        &self,
+        account: &str,
+        peer: &str,
+        wire: &str,
+        reason: &str,
+    ) -> rusqlite::Result<Option<Message>> {
+        let Some(id) = self.own_wire_id(account, peer, wire)? else {
+            return Ok(None);
+        };
+        let Some(mut message) = self
+            .message(account, peer, &id)
+            .filter(|m| m.own && m.wire_id == wire && !m.retracted)
+        else {
+            return Ok(None);
+        };
+        message.failure_reason = reason.to_owned();
+        let tx = self.db.unchecked_transaction()?;
+        self.upsert_message(account, peer, &message)?;
+        tx.commit()?;
+        Ok(Some(message))
+    }
+    /// Record that the own message `wire` went out without `skipped` room members.
+    pub fn record_skipped(
+        &self,
+        account: &str,
+        peer: &str,
+        wire: &str,
+        skipped: &[(String, String)],
+    ) -> rusqlite::Result<Option<Message>> {
+        let Some(id) = self.own_wire_id(account, peer, wire)? else {
+            return Ok(None);
+        };
+        let Some(mut message) = self
+            .message(account, peer, &id)
+            .filter(|m| m.own && m.wire_id == wire && !m.retracted)
+        else {
+            return Ok(None);
+        };
+        message.skipped_members = skipped.to_vec();
+        let tx = self.db.unchecked_transaction()?;
+        self.upsert_message(account, peer, &message)?;
+        tx.commit()?;
         Ok(Some(message))
     }
     pub fn interrupt_messages(&self, owner: &str) -> rusqlite::Result<()> {
@@ -829,6 +886,33 @@ pub fn same_source(old: &Message, new: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sent_encrypted_only_counts_own_encrypted_messages_to_that_peer() {
+        let store = Store::open(true).unwrap();
+        let owner = "me@fixture.invalid";
+        store
+            .save_account(&Account { jid: owner.into(), host: String::new(), port: 5222, direct_tls: false })
+            .unwrap();
+        let room = "room@conference.example.org";
+        let mut state = State::live(owner, vec![]);
+        for peer in [room, "other@conference.example.org"] {
+            state.chat_for(peer);
+        }
+        store.save(&state).unwrap();
+        let save = |peer: &str, id: &str, own: bool, mode: crate::encryption_policy::Mode| {
+            let mut message = Message { id: id.into(), wire_id: id.into(), own, text: "hi".into(), kind: "text".into(), ..Default::default() };
+            message.set_encryption(mode, "fp".into());
+            store.save_outbox_row(owner, peer, &message).unwrap();
+        };
+        assert!(!store.sent_encrypted(owner, room).unwrap(), "nothing sent yet");
+        save(room, "plain", true, crate::encryption_policy::Mode::Plain);
+        save(room, "theirs", false, crate::encryption_policy::Mode::Pq);
+        save("other@conference.example.org", "elsewhere", true, crate::encryption_policy::Mode::Pq);
+        assert!(!store.sent_encrypted(owner, room).unwrap(), "plain, someone else's and another room do not count");
+        save(room, "mine", true, crate::encryption_policy::Mode::Legacy);
+        assert!(store.sent_encrypted(owner, room).unwrap());
+        assert!(!store.sent_encrypted("someone-else@fixture.invalid", room).unwrap(), "account scoped");
+    }
     #[test]
     fn folder_visibility_reload_is_account_scoped_and_legacy_safe() {
         let store = Store::open(true).unwrap();

@@ -7,6 +7,7 @@ use crate::{
     widgets::*,
 };
 use adw::prelude::*;
+use crate::components::{ContactRow, NavRow};
 use gtk::{gio, glib};
 use std::{
     cell::{Cell, RefCell},
@@ -308,13 +309,11 @@ impl Ui {
             });
             choices.add(&trust);
             if contact_access {
-                let access = adw::ActionRow::builder()
-                    .title("Control Access")
-                    .subtitle("Presence subscriptions and contact-only profile data")
-                    .activatable(true)
-                    .build();
-                access.add_prefix(&gtk::Image::from_icon_name("changes-prevent-symbolic"));
-                access.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                let access = NavRow::new(
+                    "changes-prevent-symbolic",
+                    "Control Access",
+                    Some("Presence subscriptions and contact-only profile data"),
+                );
                 let weak = Rc::downgrade(self);
                 let target = peer.clone();
                 access.connect_activated(move |_| {
@@ -505,6 +504,21 @@ impl Ui {
             }
         }
     }
+    pub(crate) fn track_dialog(self: &Rc<Self>, dialog: &impl IsA<adw::Dialog>) {
+        let dialog = dialog.as_ref();
+        self.dialogs.borrow_mut().push(dialog.clone());
+        let weak = Rc::downgrade(self);
+        dialog.connect_closed(move |dialog| {
+            if let Some(ui) = weak.upgrade() {
+                if let Ok(mut dialogs) = ui.dialogs.try_borrow_mut() {
+                    dialogs.retain(|old| old != dialog);
+                }
+                // Closing a modal does not necessarily reactivate the application window.
+                ui.mark_visible_chat_read();
+                ui.schedule_history_maintenance();
+            }
+        });
+    }
     pub fn dialog(
         self: &Rc<Self>,
         title: &str,
@@ -524,15 +538,7 @@ impl Ui {
         view.add_top_bar(&header);
         view.set_content(Some(child));
         d.set_child(Some(&view));
-        self.dialogs.borrow_mut().push(d.clone());
-        let weak = Rc::downgrade(self);
-        d.connect_closed(move |d| {
-            if let Some(ui) = weak.upgrade() {
-                if let Ok(mut dialogs) = ui.dialogs.try_borrow_mut() {
-                    dialogs.retain(|old| old != d);
-                }
-            }
-        });
+        self.track_dialog(&d);
         d.present(Some(&self.window));
         (d, header)
     }
@@ -547,38 +553,10 @@ impl Ui {
         let weak = Rc::downgrade(self);
         right.connect_pressed(move |_, _, x, y| {
             if let (Some(ui), Some(parent)) = (weak.upgrade(), parent.upgrade()) {
-                let p = gtk::Popover::builder().has_arrow(false).build();
-                p.add_css_class("message-menu");
+                let weak=Rc::downgrade(&ui);
+                let p=crate::widgets::context_menu(&items,move|key|{if let Some(ui)=weak.upgrade(){ui.context_action(key);}});
                 p.set_parent(&parent);
-                p.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                let content = bx(true, 2);
-                content.add_css_class("message-menu-panel");
-                for (title, key) in &items {
-                    let b = gtk::Button::with_label(title);
-                    b.add_css_class("flat");
-                    b.add_css_class("context-menu-row");
-                    let weak = Rc::downgrade(&ui);
-                    let pop = p.downgrade();
-                    let key = key.clone();
-                    b.connect_clicked(move |_| {
-                        if let Some(p) = pop.upgrade() {
-                            p.popdown();
-                            if p.parent().is_some() {
-                                p.unparent()
-                            }
-                        }
-                        if let Some(ui) = weak.upgrade() {
-                            ui.context_action(&key)
-                        }
-                    });
-                    content.append(&b)
-                }
-                p.set_child(Some(&content));
-                p.connect_closed(|p| {
-                    if p.parent().is_some() {
-                        p.unparent()
-                    }
-                });
+                p.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32,y as i32,1,1)));
                 p.popup();
             }
         });
@@ -588,6 +566,7 @@ impl Ui {
         let (action, id) = key.split_once(':').unwrap_or((key, ""));
         match action {
             "story-new" => self.new_story(),
+            "story-history" => self.show_story_history(),
             "folder-edit" => self.edit_folder(id),
             "folder-new" => self.edit_folder(""),
             "folder-hide-all" => {
@@ -743,17 +722,8 @@ impl Ui {
         ] {
             let e = adw::ExpanderRow::builder().title(title).build();
             for chat in &self.state.borrow().chats {
-                let check = gtk::CheckButton::builder()
-                    .active(selected.contains(&chat.id))
-                    .valign(gtk::Align::Center)
-                    .build();
-                let row = adw::ActionRow::builder()
-                    .title(&chat.name)
-                    .use_markup(false)
-                    .activatable_widget(&check)
-                    .build();
-                row.add_prefix(&avatar(chat, 32));
-                row.add_suffix(&check);
+                let row = ContactRow::new(&chat.name, None, &avatar(chat, 32));
+                let check = row.with_check(selected.contains(&chat.id));
                 e.add_row(&row);
                 choices
                     .entry(key.into())
@@ -880,6 +850,11 @@ impl Ui {
             let owner = account.jid.clone();
             self.weak_button(&remove, move |s| s.remove_account(&owner));
             controls.append(&remove);
+            let delete = icon_button("edit-delete-symbolic", "Delete account on server…");
+            delete.add_css_class("destructive-action");
+            let owner = account.jid.clone();
+            self.weak_button(&delete, move |s| s.delete_account(&owner));
+            controls.append(&delete);
             row.add_suffix(&controls);
             g.add(&row)
         }
@@ -896,6 +871,38 @@ impl Ui {
             }
         });
         options.add(&add);
+        if !self.state.borrow().account.is_empty() && self.online.get() {
+            let server = adw::PreferencesGroup::builder()
+                .title("Server")
+                .description("For the account you are signed in to.")
+                .build();
+            let invite = NavRow::new(
+                "emblem-shared-symbolic",
+                "Create Invite Link",
+                Some("Let someone create an account on this server and add you"),
+            )
+            .without_chevron();
+            let weak = Rc::downgrade(self);
+            invite.connect_activated(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.create_invite_link();
+                }
+            });
+            server.add(&invite);
+            let commands = NavRow::new(
+                "utilities-terminal-symbolic",
+                "Server Commands…",
+                Some("Run the commands your server offers"),
+            );
+            let weak = Rc::downgrade(self);
+            commands.connect_activated(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.server_commands();
+                }
+            });
+            server.add(&commands);
+            page.add(&server);
+        }
         if !self.state.borrow().account.is_empty() {
             let row = adw::ActionRow::builder()
                 .title("Disconnect")
@@ -1056,49 +1063,101 @@ impl Ui {
             if response != "remove" {
                 return;
             }
+            if let Some(ui) = weak.upgrade() {
+                ui.remove_local_account(owner.clone());
+            }
+        });
+        d.present(Some(&self.window));
+    }
+    /// Forget `owner` on this device: saved sign-in, history, drafts and every cache. Does not
+    /// touch the server.
+    pub fn remove_local_account(self: &Rc<Self>, owner: String) {
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = crate::credentials::remove(&owner).await;
+            let Some(ui) = weak.upgrade() else { return };
+            if let Err(error) = result {
+                ui.notice(&format!("Could not remove saved sign-in. {error}"));
+                return;
+            }
+            if ui.state.borrow().account == owner {
+                let demo = ui.demo.borrow().clone();
+                ui.activate_state(demo);
+            }
+            if ui.store.forget(&owner).is_err() {
+                ui.notice("Local account removal failed");
+                return;
+            }
+            if let Err(error) = crate::gifs::forget(&owner).await {
+                ui.notice(&format!("Could not remove saved GIFs. {error}"));
+            }
+            let cleanup_owner = owner.clone();
+            let cleanup = gtk::gio::spawn_blocking(move || {
+                (
+                    crate::downloads::forget(&cleanup_owner),
+                    crate::link_previews::forget(&cleanup_owner),
+                    crate::preview_cache::forget(&cleanup_owner),
+                )
+            });
+            let weak = Rc::downgrade(&ui);
+            drop(ui);
+            let cleanup = cleanup.await;
+            let Some(ui) = weak.upgrade() else { return };
+            match cleanup {
+                Ok((attachments, previews, stickers)) => {
+                    if let Err(reason) = attachments {
+                        ui.notice(reason);
+                    }
+                    if let Err(reason) = previews {
+                        ui.notice(reason);
+                    }
+                    if let Err(reason) = stickers {
+                        ui.notice(reason);
+                    }
+                }
+                Err(_) => ui.notice("Local cache removal failed"),
+            }
+            if !ui.smoke && ui.store.accounts().is_empty() {
+                ui.show_welcome();
+            } else {
+                ui.accounts_dialog();
+            }
+        });
+    }
+    /// Delete `owner` on its server, then forget it on this device. Only the signed-in, online
+    /// account can be deleted, and only after its full address is typed into the dialog.
+    pub fn delete_account(self: &Rc<Self>, owner: &str) {
+        if self.state.borrow().account != owner || !self.online.get() {
+            self.notice("Connect to this account first. The server only deletes the account you are signed in to.");
+            return;
+        }
+        let (d, entry) = account_deletion_dialog(owner);
+        let owner = owner.to_string();
+        let weak = Rc::downgrade(self);
+        d.connect_response(None, move |_, response| {
+            // The button is disabled until the address matches; check again so a changed
+            // response id or a stray activation can never skip the confirmation.
+            if response != "delete" || !crate::account_deletion::confirmation_matches(&owner, &entry.text()) {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(tx) = ui.session.borrow().as_ref().map(|s| s.tx.clone()) else {
+                ui.notice("Connect to this account first.");
+                return;
+            };
             let owner = owner.clone();
             let weak = weak.clone();
             glib::MainContext::default().spawn_local(async move {
-                let result = crate::credentials::remove(&owner).await;
+                let reply = crate::iq::Client::new(tx)
+                    .request_on_main_loop(&owner, crate::iq::Kind::Set, crate::account_deletion::cancel_registration())
+                    .await;
                 let Some(ui) = weak.upgrade() else { return };
-                if let Err(error) = result {
-                    ui.notice(&format!("Could not remove saved sign-in. {error}"));
-                    return;
-                }
-                if ui.state.borrow().account == owner {
-                    let demo = ui.demo.borrow().clone();
-                    ui.activate_state(demo);
-                }
-                if ui.store.forget(&owner).is_err() {
-                    ui.notice("Local account removal failed");
-                    return;
-                }
-                let cleanup_owner = owner.clone();
-                let cleanup = gtk::gio::spawn_blocking(move || {
-                    (
-                        crate::downloads::forget(&cleanup_owner),
-                        crate::link_previews::forget(&cleanup_owner),
-                    )
-                });
-                let weak = Rc::downgrade(&ui);
-                drop(ui);
-                let cleanup = cleanup.await;
-                let Some(ui) = weak.upgrade() else { return };
-                match cleanup {
-                    Ok((attachments, previews)) => {
-                        if let Err(reason) = attachments {
-                            ui.notice(reason);
-                        }
-                        if let Err(reason) = previews {
-                            ui.notice(reason);
-                        }
+                match reply {
+                    Ok(_) => {
+                        ui.notice("Account deleted on the server");
+                        ui.remove_local_account(owner);
                     }
-                    Err(_) => ui.notice("Local cache removal failed"),
-                }
-                if !ui.smoke && ui.store.accounts().is_empty() {
-                    ui.show_welcome();
-                } else {
-                    ui.accounts_dialog();
+                    Err(error) => ui.notice(&crate::account_deletion::failure_notice(&error)),
                 }
             });
         });
@@ -1122,17 +1181,12 @@ impl Ui {
             if c.group || c.id == "saved" {
                 continue;
             }
-            let row = adw::ActionRow::builder()
-                .title(&c.name)
-                .subtitle(if live {
-                    c.jid.as_str()
-                } else {
-                    c.subtitle.as_str()
-                })
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            row.add_prefix(&avatar(&c, 36));
+            let row = ContactRow::new(
+                &c.name,
+                Some(if live { c.jid.as_str() } else { c.subtitle.as_str() }),
+                &avatar(&c, 36),
+            )
+            .pickable();
             let weak = Rc::downgrade(self);
             let d = d.clone();
             row.connect_activated(move |_| {
@@ -1222,12 +1276,9 @@ impl Ui {
             .iter()
             .filter(|c| !c.group && c.id != "saved")
         {
+            let row = ContactRow::new(&c.name, None, &avatar(c, 32));
             let check = gtk::CheckButton::new();
-            let row = adw::ActionRow::builder()
-                .title(&c.name)
-                .activatable_widget(&check)
-                .build();
-            row.add_prefix(&avatar(c, 32));
+            row.set_activatable_widget(Some(&check));
             row.add_suffix(&check);
             people.add(&row)
         }
@@ -1268,17 +1319,12 @@ impl Ui {
             if c.group || c.id == "saved" {
                 continue;
             }
-            let row = adw::ActionRow::builder()
-                .title(&c.name)
-                .subtitle(if c.jid.is_empty() {
-                    &c.subtitle
-                } else {
-                    &c.jid
-                })
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            row.add_prefix(&avatar(&c, 36));
+            let row = ContactRow::new(
+                &c.name,
+                Some(if c.jid.is_empty() { &c.subtitle } else { &c.jid }),
+                &avatar(&c, 36),
+            )
+            .pickable();
             let weak = Rc::downgrade(self);
             row.connect_activated(move |_| {
                 if let Some(ui) = weak.upgrade() {
@@ -1301,12 +1347,7 @@ impl Ui {
                 continue;
             }
             count += 1;
-            let row = adw::ActionRow::builder()
-                .title(&c.name)
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            row.add_prefix(&avatar(&c, 36));
+            let row = ContactRow::new(&c.name, None, &avatar(&c, 36)).pickable();
             let id = c.id.clone();
             let weak = Rc::downgrade(self);
             row.connect_activated(move |_| {
@@ -1464,18 +1505,23 @@ impl Ui {
         });
         appearance.add(&emoji);
         general.add(&appearance);
+        let downloads=adw::PreferencesGroup::builder().title("Automatic Downloads").description("Download files from contacts and joined groups while viewing the conversation.").build();
+        let enabled=adw::SwitchRow::builder().title("Automatically download media").subtitle("Photos, videos, audio and stickers").active(self.auto_download_enabled.get()).build();
+        let size=adw::SpinRow::with_range(1.,4000.,1.);size.set_title("Maximum file size");size.set_subtitle("MB per file");size.set_value((self.auto_download_limit.get()/1024/1024) as f64);size.set_sensitive(enabled.is_active());
+        let weak=Rc::downgrade(self);enabled.connect_active_notify(move|row|{if let Some(ui)=weak.upgrade(){ui.auto_download_enabled.set(row.is_active());ui.downloads.borrow_mut().reset_automatic();let _=ui.store.set_pref("auto_download_files",if row.is_active(){"true"}else{"false"});}});
+        enabled.bind_property("active",&size,"sensitive").sync_create().build();
+        let weak=Rc::downgrade(self);size.connect_value_notify(move|row|{if let Some(ui)=weak.upgrade(){let mb=row.value() as u64;ui.auto_download_limit.set(mb*1024*1024);ui.downloads.borrow_mut().reset_automatic();let _=ui.store.set_pref("auto_download_limit_mb",&mb.to_string());}});
+        downloads.add(&enabled);downloads.add(&size);general.add(&downloads);
         let owner = self.state.borrow().account.clone();
         let privacy = adw::PreferencesGroup::builder()
             .title("Privacy and Notifications")
             .build();
         if !owner.is_empty() {
-            let blocked = adw::ActionRow::builder()
-                .title("Blocked Contacts")
-                .subtitle(self.blocking_summary())
-                .activatable(true)
-                .build();
-            blocked.add_prefix(&gtk::Image::from_icon_name("changes-prevent-symbolic"));
-            blocked.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+            let blocked = NavRow::new(
+                "changes-prevent-symbolic",
+                "Blocked Contacts",
+                Some(self.blocking_summary().as_str()),
+            );
             let weak = Rc::downgrade(self);
             blocked.connect_activated(move |_| {
                 if let Some(ui) = weak.upgrade() {
@@ -1509,6 +1555,30 @@ impl Ui {
                 "Show text in desktop notifications",
                 false,
             ),
+            (
+                "offer_send_anyway",
+                "Offer Send Anyway",
+                "In group chats, offer to send an encrypted message to the members who have keys, then keep doing so for 30 minutes",
+                true,
+            ),
+            (
+                crate::presence_privacy::LAST_SEEN,
+                crate::presence_privacy::OPTIONS[0].1,
+                crate::presence_privacy::OPTIONS[0].2,
+                true,
+            ),
+            (
+                crate::presence_privacy::CONTACT_STATUS,
+                crate::presence_privacy::OPTIONS[1].1,
+                crate::presence_privacy::OPTIONS[1].2,
+                true,
+            ),
+            (
+                crate::presence_privacy::HATS,
+                crate::presence_privacy::OPTIONS[2].1,
+                crate::presence_privacy::OPTIONS[2].2,
+                true,
+            ),
         ] {
             let row = adw::SwitchRow::builder()
                 .title(title)
@@ -1523,6 +1593,7 @@ impl Ui {
                         &format!("{key}:{owner}"),
                         if r.is_active() { "true" } else { "false" },
                     );
+                    ui.presence_privacy_changed();
                 }
             });
             privacy.add(&row)
@@ -1657,6 +1728,26 @@ impl Ui {
             }
         });
         behavior.add(&completion);
+        let stickers = adw::PreferencesGroup::builder()
+            .title("Stickers")
+            .build();
+        let keep_open = adw::SwitchRow::builder()
+            .title("Keep stickers tab open after sending")
+            .subtitle("When off, the tab closes after a sticker is sent. Hold Shift while clicking a sticker to keep it open.")
+            .active(self.store.pref(crate::media_library_ui::STICKERS_KEEP_OPEN, "true") != "false")
+            .build();
+        let weak = Rc::downgrade(self);
+        keep_open.connect_active_notify(move |row| {
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.store.set_pref(
+                    crate::media_library_ui::STICKERS_KEEP_OPEN,
+                    if row.is_active() { "true" } else { "false" },
+                );
+            }
+        });
+        stickers.add(&keep_open);
+        behavior.add(&stickers);
+        self.add_double_click_preferences(&behavior);
         dialog.add(&behavior);
         let account = adw::PreferencesPage::builder()
             .title("Account")
@@ -1767,7 +1858,7 @@ impl Ui {
                 dialog.add(&p)
             }
         }
-        self.dialogs.borrow_mut().push(dialog.clone().upcast());
+        self.track_dialog(&dialog);
         dialog.present(Some(&self.window));
     }
     pub fn shortcuts(self: &Rc<Self>) {
@@ -1779,24 +1870,42 @@ impl Ui {
                     ("New conversation", "<Control>n"),
                     ("Search", "<Control>f"),
                     ("Attach files", "<Control>o"),
+                    ("Previous folder", "<Alt>Left"),
+                    ("Next folder", "<Alt>Right"),
+                    ("Previous chat", "<Alt>Up"),
+                    ("Next chat", "<Alt>Down"),
                 ],
             ),
             (
                 "View",
-                vec![("Media sidebar", "F9"), ("Preferences", "<Control>comma")],
+                vec![("Media sidebar", "F9"), ("Emoji panel", "<Control>e"),
+                    ("Sticker panel", "<Control>s"), ("GIF panel", "<Control>g"),
+                    ("Preferences", "<Control>comma")],
             ),
             (
                 "Messages",
-                vec![("Send", "Return"), ("New line", "<Shift>Return")],
+                vec![
+                    ("Send", "Return"), ("New line", "<Shift>Return"),
+                    ("Scroll messages up", "Page_Up"), ("Scroll messages down", "Page_Down"),
+                    ("Jump to latest message", "End"),
+                ],
+            ),
+            (
+                "Edit Picture",
+                crate::picture_editor_ui::EDITOR_SHORTCUTS
+                    .iter()
+                    .map(|(_, name, keys)| (*name, *keys))
+                    .collect(),
             ),
         ] {
             let section = adw::ShortcutsSection::new(Some(title));
             for (name, key) in items {
-                section.add(adw::ShortcutsItem::new(name, key))
+                // Alternatives are written `a|b` for binding; the window lists them side by side.
+                section.add(adw::ShortcutsItem::new(name, &key.replace('|', " ")))
             }
             d.add(section)
         }
-        self.dialogs.borrow_mut().push(d.clone().upcast());
+        self.track_dialog(&d);
         d.present(Some(&self.window));
     }
     pub fn preview_form(self: &Rc<Self>, title: &str, fields: &[&str]) {
@@ -1845,12 +1954,7 @@ impl Ui {
         page.add(&g);
         let (d, _) = self.dialog("Forward Messages", &page, 520, 480);
         for c in self.state.borrow().chats.clone() {
-            let row = adw::ActionRow::builder()
-                .title(&c.name)
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            row.add_prefix(&avatar(&c, 32));
+            let row = ContactRow::new(&c.name, None, &avatar(&c, 32)).pickable();
             let messages = messages.clone();
             let owner = owner.clone();
             let weak = Rc::downgrade(self);
@@ -1985,6 +2089,15 @@ impl Ui {
             ("Delivery", m.delivery.clone()),
             ("Message ID", m.wire_id.clone()),
         ] {
+            if title == "Message ID" && m.own && !m.failure_reason.is_empty() {
+                g.add(
+                    &adw::ActionRow::builder()
+                        .title("What Went Wrong")
+                        .subtitle(crate::text_safety::failure_reason(&m.failure_reason))
+                        .use_markup(false)
+                        .build(),
+                );
+            }
             g.add(
                 &adw::ActionRow::builder()
                     .title(title)
@@ -1992,6 +2105,24 @@ impl Ui {
                     .use_markup(false)
                     .build(),
             )
+        }
+        if m.own && !m.skipped_members.is_empty() {
+            g.add(
+                &adw::ActionRow::builder()
+                    .title("Sent Partially")
+                    .subtitle("This message is encrypted and was sent, but not to the room members listed below. Their keys could not be used, so they cannot read it.")
+                    .use_markup(false)
+                    .build(),
+            );
+            for (member, why) in &m.skipped_members {
+                g.add(
+                    &adw::ActionRow::builder()
+                        .title(crate::text_safety::visible(member, 128))
+                        .subtitle(crate::text_safety::visible(why, 200))
+                        .use_markup(false)
+                        .build(),
+                );
+            }
         }
         if !m.fingerprint.is_empty() {
             g.add(
@@ -2017,6 +2148,30 @@ impl Ui {
                 );
             }
         }
+        let state = self.state.borrow();
+        let failures = self.store.message_failures(&state.account, &state.current().jid, &m.id);
+        drop(state);
+        let failures = failures.unwrap_or_default();
+        if !failures.is_empty() || m.delivery == "failed" {
+            let group = adw::PreferencesGroup::builder().title("Failure Details").build();
+            if failures.is_empty() {
+                group.add(&adw::ActionRow::builder().title("No failure reason was saved by the earlier build")
+                    .subtitle("Retry the retained message to record a new diagnostic.").use_markup(false).build());
+            }
+            for failure in failures {
+                let row = adw::ActionRow::builder().title(&failure.stage)
+                    .subtitle(format!("{} · {}", failure.time, failure.detail))
+                    .subtitle_lines(0).subtitle_selectable(true).use_markup(false).build();
+                let copy = icon_button("edit-copy-symbolic", "Copy failure details");
+                copy.set_valign(gtk::Align::Center);
+                let clipboard = self.window.clipboard();
+                let value = format!("Message: {}\nTime: {}\nStage: {}\n{}", m.wire_id, failure.time, failure.stage, failure.detail);
+                copy.connect_clicked(move |_| clipboard.set_text(&value));
+                row.add_suffix(&copy);
+                group.add(&row);
+            }
+            page.add(&group);
+        }
         page.add(&g);
         self.dialog("Message Details", &page, 520, 440);
     }
@@ -2031,22 +2186,30 @@ impl Ui {
             .is_some_and(|m| m.upload.is_some())
         {
             let id = id.to_string();
-            self.choose_sending(move |ui, _| {
+            self.choose_sending(move |ui, mode| {
                 let peer = ui.state.borrow().current().jid.clone();
-                ui.start_upload(&peer, &id);
+                ui.start_upload_with_mode(&peer, &id, mode);
             });
             return;
         }
+        let attachment = self.state.borrow().message(id).is_some_and(|m| m.attachment.is_some());
+        if attachment {
+            let id = id.to_owned();
+            self.choose_sending(move |ui, mode| ui.retry_prepared(&id, Some(mode)));
+        } else {
+            self.retry_prepared(id, None);
+        }
+    }
+    fn retry_prepared(self: &Rc<Self>, id: &str, approved: Option<crate::encryption_policy::Mode>) {
         let state = self.state.borrow();
         let file_mode_changed = state.message(id).is_some_and(|message| {
             message.attachment.is_some()
-                && (self.sending_mode(state.current()) != Some(message.mode())
-                    || self.fingerprint_for_send(message.mode()).as_deref()
-                        != Some(&message.fingerprint))
+                && (approved != Some(message.mode())
+                    || self.fingerprint_for_send(message.mode()).as_deref() != Some(&message.fingerprint))
         });
         drop(state);
         if file_mode_changed {
-            self.notice("Encryption changed. Select the file again to send a fresh copy.");
+            self.notice("This attachment uses another encryption mode or identity. Restore its encryption setting to retry; the retained file is kept.");
             return;
         }
         if !self.online.get() {
@@ -2056,6 +2219,7 @@ impl Ui {
         let owner = self.state.borrow().account.clone();
         let chat = self.state.borrow().active.clone();
         let id = id.to_string();
+        let revision = self.encryption_revision.get();
         let d=adw::AlertDialog::builder().heading("Retry Message?").body("It may already have been received. Retrying can create a duplicate on clients that do not deduplicate IDs.").build();
         d.add_responses(&[("cancel", "Cancel"), ("retry", "Retry")]);
         let weak = Rc::downgrade(self);
@@ -2065,10 +2229,15 @@ impl Ui {
                     if ui.state.borrow().account != owner || ui.state.borrow().active != chat {
                         return;
                     }
+                    if ui.encryption_revision.get() != revision {
+                        ui.notice("Encryption settings changed while confirming. Retry the retained attachment again.");
+                        return;
+                    }
                     let mut s = ui.state.borrow_mut();
                     let peer = s.current().jid.clone();
                     if let Some(m) = s.current_mut().messages.iter_mut().find(|m| m.id == id) {
                         m.delivery = "sending".into();
+                        m.failure_reason.clear();
                         let message = m.clone();
                         drop(s);
                         if ui.persist() {
@@ -2622,6 +2791,38 @@ pub fn bind_amount(entry: &impl IsA<gtk::Editable>, review: &gtk::Button) {
         }
     });
 }
+/// The confirmation for deleting `owner` on its server. "Delete" stays disabled until the entry
+/// holds the full address, so the account cannot be deleted by accident.
+pub(crate) fn account_deletion_dialog(owner: &str) -> (adw::AlertDialog, gtk::Entry) {
+    let d = adw::AlertDialog::builder()
+        .heading("Delete Account?")
+        .body(format!(
+            "This permanently deletes {owner} on its server, with its contacts and server-stored messages. It cannot be undone, and the address may not be reusable. Everything for it on this device is removed too.\n\nTo confirm, type the full address below."
+        ))
+        .build();
+    let entry = gtk::Entry::builder()
+        .placeholder_text(owner)
+        .activates_default(false)
+        .build();
+    entry.update_property(&[gtk::accessible::Property::Label("Type the full address to confirm")]);
+    d.set_extra_child(Some(&entry));
+    d.add_responses(&[("cancel", "Cancel"), ("delete", "Delete Account")]);
+    d.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("cancel"));
+    d.set_close_response("cancel");
+    d.set_response_enabled("delete", false);
+    let owner = owner.to_string();
+    let weak = d.downgrade();
+    entry.connect_changed(move |entry| {
+        if let Some(d) = weak.upgrade() {
+            d.set_response_enabled(
+                "delete",
+                crate::account_deletion::confirmation_matches(&owner, &entry.text()),
+            );
+        }
+    });
+    (d, entry)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2635,5 +2836,36 @@ mod tests {
         }
         assert!(!positive_amount("0.0"));
         assert!(positive_amount("0.1"));
+    }
+    #[gtk::test]
+    #[ignore = "requires a native display"]
+    fn the_delete_button_stays_disabled_until_the_full_address_is_typed() {
+        gtk::init().expect("display");
+        let (d, entry) = account_deletion_dialog("bob@example.com");
+        assert!(!d.is_response_enabled("delete"), "disabled before anything is typed");
+        assert!(d.is_response_enabled("cancel"));
+        assert_eq!(d.default_response().as_deref(), Some("cancel"), "Enter must not delete");
+        assert_eq!(d.close_response(), "cancel", "Escape must not delete");
+        for partial in ["bob", "bob@", "example.com", "bob@example", "alice@example.com"] {
+            entry.set_text(partial);
+            assert!(!d.is_response_enabled("delete"), "{partial} must not enable Delete");
+        }
+        entry.set_text("bob@example.com");
+        assert!(d.is_response_enabled("delete"));
+        entry.set_text("bob@example.com ");
+        assert!(d.is_response_enabled("delete"), "trailing whitespace is forgiven");
+        entry.set_text("bob@example.co");
+        assert!(!d.is_response_enabled("delete"), "editing it again disables Delete");
+        entry.set_text("");
+        assert!(!d.is_response_enabled("delete"));
+    }
+    #[gtk::test]
+    #[ignore = "requires a native display"]
+    fn the_dialog_names_the_account_and_says_it_is_permanent() {
+        gtk::init().expect("display");
+        let (d, entry) = account_deletion_dialog("bob@example.com");
+        assert!(d.body().contains("bob@example.com"));
+        assert!(d.body().contains("permanently"));
+        assert_eq!(entry.placeholder_text().as_deref(), Some("bob@example.com"));
     }
 }

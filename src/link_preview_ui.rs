@@ -32,6 +32,20 @@ fn preview_picture(thumbnail: &Thumbnail, large: bool, video: bool) -> gtk::Widg
         picture.set_size_request(LARGE_THUMBNAIL_WIDTH, height);
     } else {
         picture.set_size_request(ARTICLE_THUMBNAIL, ARTICLE_THUMBNAIL);
+        // A picture's natural width is its pixel width, and GTK boxes hand out spare room by
+        // natural size, so a wide thumbnail would starve the text beside it. Cap it, and keep
+        // it from stretching to the height of a long text column.
+        let clamp = adw::Clamp::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .maximum_size(ARTICLE_THUMBNAIL)
+            .tightening_threshold(ARTICLE_THUMBNAIL)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .child(&picture)
+            .build();
+        if !video {
+            return clamp.upcast();
+        }
     }
     if !video {
         return picture.upcast();
@@ -412,7 +426,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[gtk::test]
     fn native_links_selection_and_preview_clamp() {
         gtk::init().unwrap();
         let source = "😀 Open example.org/a?q=1 and https://second.example/path.";
@@ -439,8 +453,9 @@ mod tests {
             Some((0, source.chars().count() as i32))
         );
         message.refresh_shape();
+        // Markup attributes remain GTK-owned; explicit attributes only retain custom shapes.
         assert!(
-            body.attributes()
+            body.layout().attributes()
                 .is_some_and(|attrs| attrs.attributes().len() >= 3)
         );
 
@@ -476,7 +491,7 @@ mod tests {
         assert!(inline_labels[0].label().contains("<a href="));
         assert!(
             inline_labels[0]
-                .attributes()
+                .layout().attributes()
                 .is_some_and(|attrs| attrs.attributes().len() >= 4)
         );
         let mut inline_pictures = Vec::new();
@@ -528,15 +543,86 @@ mod tests {
         linkify_message_label(&body,source,&crate::link_previews::clickable_urls(source,None));
         let preview=Preview{url:source.into(),display_url:source.into(),site_name:"GitHub".into(),title:"Pure-Rust sticker renderer, no Java in the Arch package, opt-in Discord emoji completion by raluvy95 · Pull Request #1 · doromiert/monogram-desktop".into(),description:"What changed Sticker renderer Replaces the rlottie C helper with src/bin/monogram-sticker-renderer.rs, which uses the pure-Rust rasterlottie crate. Protocol, size/frame limits, ...".into(),kind:Kind::Article,thumbnail:None,media:None};
         let card=link_preview_card(&preview);
-        let bubble=bx(true,0);bubble.add_css_class("message-bubble");bubble.append(&body);bubble.append(&card);
+        let bubble=crate::components::MessageBubble::new(crate::components::BubbleKind::Text);bubble.append(&body);bubble.append(&card);
         let meta=label("14:25","message-meta");meta.set_halign(gtk::Align::End);bubble.append(&meta);
-        let clamp=MessageBubbleLimit::new(&bubble,false);
+        let clamp=MessageBubbleLimit::new(&bubble,false);clamp.set_valign(gtk::Align::Start);
         let window=gtk::Window::builder().default_width(1400).default_height(300).child(&clamp).build();window.present();
         let context=glib::MainContext::default();let deadline=std::time::Instant::now()+std::time::Duration::from_millis(200);while std::time::Instant::now()<deadline {context.iteration(false);std::thread::sleep(std::time::Duration::from_millis(1));}
-        let painted=body.layout().pixel_size().0.max(card.allocated_width());
+        let painted=body.layout().pixel_size().0.max(card.width());
         eprintln!("Link-only bubble content={}, text={}, preview={}, natural={}",bubble.width(),body.layout().pixel_size().0,card.width(),bubble.measure(gtk::Orientation::Horizontal,-1).1);
         assert!(bubble.width()<=painted+2,"Unused trailing bubble space: {}px",bubble.width()-painted);
+        let source="https://x.com/NyxieonLmao/status/2121897437790945370?a=1cpwWZJOz21HzYAYEQs&s=19";
+        let wrapped=wrap(source,"message-text");
+        linkify_message_label(&wrapped,source,&crate::link_previews::clickable_urls(source,None));
+        bubble.remove(&body);bubble.prepend(&wrapped);
+        bubble.remove(&card);
+        let card=link_preview_card(&Preview {url:source.into(),display_url:source.into(),site_name:"X (formerly Twitter)".into(),title:"SmugMonke (@NyxieonLmao) on X".into(),description:"Nice n quiet".into(),thumbnail:Some(Thumbnail {path:asset("icons/mobile-emoji/emoji_tabs_faves.png"),width:88,height:88}),..preview.clone()});
+        bubble.insert_child_after(&card,Some(&wrapped));
+        let settle=||{let until=std::time::Instant::now()+std::time::Duration::from_millis(200);while std::time::Instant::now()<until {context.iteration(false);std::thread::sleep(std::time::Duration::from_millis(1));}};
+        settle();
+        assert!(wrapped.layout().line_count()>1);
+        let painted=wrapped.layout().pixel_size().0.max(card.width());
+        assert!(bubble.width()<=painted+2,"Wrapped link left unused trailing bubble space: {}px (text {}, card {})",bubble.width()-painted,wrapped.layout().pixel_size().0,card.width());
+        assert_eq!(clamp.height(),clamp.measure(gtk::Orientation::Vertical,clamp.width()).1,"wrapped preview height uses its fitted width");
+        let stable=(bubble.width(),bubble.height(),wrapped.layout().line_count());settle();assert_eq!(stable,(bubble.width(),bubble.height(),wrapped.layout().line_count()),"fitting converges without width/height oscillation");
+        window.set_default_size(280,400);settle();assert!(clamp.width()<=280);assert!(wrapped.layout().pixel_size().0<=wrapped.width());
         window.close();
+    }
+
+    /// Regression for the clipped link-preview bubble: a long link with an article card and a
+    /// wide thumbnail in a narrow chat must stay inside its bubble with a usable text column.
+    #[test]
+    #[ignore = "requires private GTK display"]
+    fn long_link_with_thumbnail_stays_inside_its_bubble() {
+        gtk::init().unwrap();
+        let css=gtk::CssProvider::new();css.load_from_path(asset("style.css"));
+        gtk::style_context_add_provider_for_display(&gtk::gdk::Display::default().unwrap(),&css,gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let path=std::env::temp_dir().join(format!("monogram-preview-{}.png",std::process::id()));
+        let pixels=vec![160u8;600*400*4];
+        gtk::gdk::MemoryTexture::new(600,400,gtk::gdk::MemoryFormat::R8g8b8a8,&glib::Bytes::from_owned(pixels),600*4).save_to_png(&path).unwrap();
+        let source="https://x.com/stonetoss/status/2121649346471219227?a=OryBhoQnfblv81EkuT0&s=19";
+        let body=wrap(source,"message-text");
+        linkify_message_label(&body,source,&crate::link_previews::clickable_urls(source,None));
+        let preview=Preview{url:source.into(),display_url:"x.com/stonetoss/status/2121649346471219227".into(),site_name:"X (formerly Twitter)".into(),title:"Stoneto-ss Comics (@stonetoss)".into(),description:"Stoneto-ss Comics (@stonetoss) on X".into(),kind:Kind::Article,thumbnail:Some(Thumbnail{path:path.clone(),width:600,height:400}),media:None};
+        let card=link_preview_card(&preview);
+        let bubble=crate::components::MessageBubble::new(crate::components::BubbleKind::Text);bubble.append(&body);bubble.append(&card);
+        let meta=label("14:25","message-meta");meta.set_halign(gtk::Align::End);bubble.append(&meta);
+        let clamp=MessageBubbleLimit::new(&bubble,false);
+        let window=gtk::Window::builder().default_width(600).default_height(320).child(&clamp).build();window.present();
+        let context=glib::MainContext::default();let deadline=std::time::Instant::now()+std::time::Duration::from_millis(300);while std::time::Instant::now()<deadline {context.iteration(false);std::thread::sleep(std::time::Duration::from_millis(1));}
+        let (body_text,card_width,bubble_width)=(body.layout().pixel_size().0,card.width(),bubble.width());
+        let mut found=Vec::new();labels(card.upcast_ref(),&mut found);
+        let column=found.iter().map(|l|l.width()).max().unwrap_or(0);
+        eprintln!("bubble={bubble_width} body.width={} body.text={body_text} card={card_width} text-column={column} natural={}",body.width(),bubble.measure(gtk::Orientation::Horizontal,-1).1);
+        if let Some(out)=std::env::var_os("MONOGRAM_LINK_CAPTURE") {
+            let snapshot=gtk::Snapshot::new();
+            gtk::WidgetPaintable::new(Some(&window)).snapshot(&snapshot,window.width() as f64,window.height() as f64);
+            window.renderer().unwrap().render_texture(&snapshot.to_node().unwrap(),None).save_to_png(&out).unwrap();
+        }
+        let _=std::fs::remove_file(&path);
+        assert!(body_text<=bubble_width,"link text ({body_text}px) is wider than its bubble ({bubble_width}px)");
+        assert!(column>=110,"preview text column is crushed to {column}px");
+        window.close();
+    }
+    /// The timeline scrolls with a horizontal policy of Never, so GTK hands its widest child's
+    /// minimum width to the whole chat pane. A single unbreakable link must not do that: it made
+    /// the window request more width than its breakpoint bin had (a libadwaita warning on every
+    /// layout pass).
+    #[test]
+    #[ignore = "requires private GTK display"]
+    fn long_link_does_not_raise_the_timelines_minimum_width() {
+        gtk::init().unwrap();
+        let css=gtk::CssProvider::new();css.load_from_path(asset("style.css"));
+        gtk::style_context_add_provider_for_display(&gtk::gdk::Display::default().unwrap(),&css,gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let source="https://x.com/stonetoss/status/2121649346471219227?a=OryBhoQnfblv81EkuT0&s=19";
+        let body=wrap(source,"message-text");
+        linkify_message_label(&body,source,&crate::link_previews::clickable_urls(source,None));
+        assert!(body.measure(gtk::Orientation::Horizontal,-1).0>400,"the link is expected to be unbreakable");
+        let bubble=crate::components::MessageBubble::new(crate::components::BubbleKind::Text);bubble.append(&body);
+        let column=bx(true,0);column.append(&MessageBubbleLimit::new(&bubble,false));
+        let scroller=scroll(&column);
+        let minimum=scroller.measure(gtk::Orientation::Horizontal,-1).0;
+        assert!(minimum<=360,"a long link raised the timeline's minimum width to {minimum}px");
     }
 
 }

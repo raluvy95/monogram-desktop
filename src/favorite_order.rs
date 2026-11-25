@@ -1,134 +1,10 @@
-//! Local favorite ordering; a drag changes order, never membership or recents.
+//! Local favorite ordering UI; a drag changes order, never membership or recents.
 use super::Ui;
 use adw::prelude::*;
 use gtk::{gdk, glib, graphene, subclass::prelude::*};
-use rusqlite::{Connection, OptionalExtension, params};
-use std::{
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+pub(crate) use crate::favorite_order_store::*;
+use std::{cell::{Cell, RefCell}, collections::HashMap, rc::Rc};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum Kind {
-    Emoji,
-    Stickers,
-    Gifs,
-}
-impl Kind {
-    fn preference(self) -> &'static str {
-        match self {
-            Self::Emoji => "picker:favorites:emoji",
-            Self::Stickers => "picker:favorites:stickers",
-            Self::Gifs => "picker:favorites:gifs",
-        }
-    }
-}
-#[derive(Default)]
-pub(crate) struct Order {
-    keys: Vec<String>,
-    ranks: HashMap<String, usize>,
-}
-impl Order {
-    fn new(keys: Vec<String>) -> Self {
-        let ranks = keys
-            .iter()
-            .enumerate()
-            .map(|(i, key)| (key.clone(), i))
-            .collect();
-        Self { keys, ranks }
-    }
-    pub(crate) fn sort<T>(&self, items: &mut [T], key: impl Fn(&T) -> String) {
-        items.sort_by_cached_key(|item| self.ranks.get(&key(item)).copied().unwrap_or(usize::MAX));
-    }
-}
-pub(crate) fn emoji_key(emoji: &str) -> String {
-    format!(
-        "emoji:{}",
-        crate::message_actions::canonical_emoji(emoji).unwrap_or_else(|| emoji.into())
-    )
-}
-pub(crate) fn pack_key(owner: &str, id: i64) -> String {
-    format!("pack:{owner}:{id}")
-}
-pub(crate) fn gif_key(owner: &str, id: &str) -> String {
-    format!("gif:{owner}\n{id}")
-}
-fn read(db: &Connection, kind: Kind) -> rusqlite::Result<Order> {
-    let saved: Option<String> = db
-        .query_row(
-            "SELECT value FROM preferences WHERE key=?",
-            [kind.preference()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let keys = match saved {
-        None => Vec::new(),
-        Some(value) => {
-            if value.len() > 4 * 1024 * 1024 {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            serde_json::from_str::<Vec<String>>(&value)
-                .map_err(|_| rusqlite::Error::InvalidQuery)?
-        }
-    };
-    let mut seen = HashSet::new();
-    Ok(Order::new(
-        keys.into_iter()
-            .filter(|key| !key.is_empty() && key.len() <= 16384 && seen.insert(key.clone()))
-            .collect(),
-    ))
-}
-fn load(db: &Connection) -> rusqlite::Result<HashMap<Kind, Order>> {
-    [Kind::Emoji, Kind::Stickers, Kind::Gifs]
-        .into_iter()
-        .map(|kind| read(db, kind).map(|order| (kind, order)))
-        .collect()
-}
-fn save_move(
-    db: &Connection,
-    kind: Kind,
-    mut actual: Vec<String>,
-    source: &str,
-    target: &str,
-) -> rusqlite::Result<Order> {
-    let transaction = db.unchecked_transaction()?;
-    let old = read(&transaction, kind)?;
-    let mut unique = HashSet::new();
-    actual.retain(|key| key.len() <= 16384 && unique.insert(key.clone()));
-    old.sort(&mut actual, Clone::clone);
-    let from = actual
-        .iter()
-        .position(|key| key == source)
-        .ok_or(rusqlite::Error::InvalidQuery)?;
-    let to = actual
-        .iter()
-        .position(|key| key == target)
-        .ok_or(rusqlite::Error::InvalidQuery)?;
-    let moved = actual.remove(from);
-    actual.insert(to, moved);
-    // Keep slots belonging to other accounts; their favorites are absent from this view.
-    let mut ordered = actual.iter();
-    let mut keys: Vec<_> = old
-        .keys
-        .into_iter()
-        .map(|key| {
-            if unique.contains(&key) {
-                ordered.next().unwrap().clone()
-            } else {
-                key
-            }
-        })
-        .collect();
-    keys.extend(ordered.cloned());
-    let value = serde_json::to_string(&keys).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    if value.len() > 4 * 1024 * 1024 {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    transaction.execute("INSERT INTO preferences(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![kind.preference(),value])?;
-    transaction.commit()?;
-    Ok(Order::new(keys))
-}
 impl Ui {
     pub(crate) fn load_favorite_orders(self: &Rc<Self>) {
         self.favorite_orders.borrow_mut().clear();
@@ -175,7 +51,7 @@ impl Ui {
         let ui = self.clone();
         let feedback = adw::Toast::new("Saving favorite order…");
         feedback.set_timeout(0);
-        self.toast.add_toast(feedback.clone());
+        self.show_toast(feedback.clone());
         glib::spawn_future_local(async move {
             let result = ui
                 .store
@@ -530,6 +406,7 @@ pub(crate) fn attach(
     let armed_key = drag_key.clone();
     source.connect_prepare(move |source, x, y| {
         let ui = weak.upgrade()?;
+        if ui.picker_zoom.is_active(){source.set_state(gtk::EventSequenceState::Denied);return None;}
         if ui.generation.get() != generation || ui.state.borrow().account != source_owner {
             source.set_state(gtk::EventSequenceState::Claimed);
             return None;
@@ -672,40 +549,4 @@ pub(crate) fn attach(
         ui.move_favorite(kind, keys(), drag.key.clone(), key.clone())
     });
     widget.add_controller(target);
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn order_moves_preserve_hidden_accounts_and_never_change_membership() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE preferences(key TEXT PRIMARY KEY,value TEXT)")
-            .unwrap();
-        let items = vec![
-            "emoji:❤️".into(),
-            "pack:first:1".into(),
-            "pack:other:2".into(),
-            "emoji:😅".into(),
-        ];
-        let first = save_move(&db, Kind::Emoji, items.clone(), &items[0], &items[3]).unwrap();
-        assert_eq!(
-            first.keys,
-            ["pack:first:1", "pack:other:2", "emoji:😅", "emoji:❤️"]
-        );
-        let second = save_move(
-            &db,
-            Kind::Emoji,
-            vec![items[0].clone(), items[1].clone(), items[3].clone()],
-            &items[0],
-            &items[1],
-        )
-        .unwrap();
-        assert_eq!(
-            second.keys,
-            ["emoji:❤️", "pack:other:2", "pack:first:1", "emoji:😅"]
-        );
-        assert!(save_move(&db, Kind::Emoji, items.clone(), "not-a-favorite", &items[0]).is_err());
-        assert_eq!(read(&db, Kind::Emoji).unwrap().keys, second.keys);
-        assert!(read(&db, Kind::Stickers).unwrap().keys.is_empty());
-    }
 }

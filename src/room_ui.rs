@@ -6,6 +6,7 @@ use crate::{
     widgets::*,
 };
 use adw::prelude::*;
+use crate::components::{ContactRow, NavRow};
 use gtk::glib;
 use std::{
     cell::{Cell, RefCell},
@@ -187,14 +188,9 @@ impl Ui {
                     && crate::protocol::bare(&chat.jid).ok().as_deref() == Some(chat.jid.as_str())
             })
             .map(|chat| {
+                let row = ContactRow::new(&chat.name, Some(&chat.jid), &self.chat_avatar(chat, 32));
                 let check = gtk::CheckButton::new();
-                let row = adw::ActionRow::builder()
-                    .title(&chat.name)
-                    .subtitle(&chat.jid)
-                    .use_markup(false)
-                    .activatable_widget(&check)
-                    .build();
-                row.add_prefix(&self.chat_avatar(chat, 32));
+                row.set_activatable_widget(Some(&check));
                 row.add_suffix(&check);
                 people.add(&row);
                 (chat.jid.clone(), check)
@@ -289,7 +285,12 @@ impl Ui {
                             dialog.close();
                         }
                         ui.open_room(&info);
-                        ui.invite_room_people(&info.jid, members);
+                        ui.invite_room_people(
+                            &info.jid,
+                            members,
+                            "Group Created; Invitations Incomplete",
+                            false,
+                        );
                     }
                     result => {
                         if let Some(status) = status.upgrade() {
@@ -308,7 +309,13 @@ impl Ui {
             running.replace(Some(task));
         });
     }
-    fn invite_room_people(self: &Rc<Self>, peer: &str, members: Vec<String>) {
+    pub(crate) fn invite_room_people(
+        self: &Rc<Self>,
+        peer: &str,
+        members: Vec<String>,
+        failure_heading: &'static str,
+        confirm: bool,
+    ) {
         if members.is_empty() {
             return;
         }
@@ -330,13 +337,18 @@ impl Ui {
                 .filter(|ui| ui.generation.get() == generation)
             {
                 let message = match result {
-                    Ok(Ok(failed)) if failed.is_empty() => return,
+                    Ok(Ok(failed)) if failed.is_empty() => {
+                        if confirm {
+                            ui.notice("Invitations sent");
+                        }
+                        return;
+                    }
                     Ok(Ok(failed)) => format!("Could not invite: {}", failed.join(", ")),
                     Ok(Err(error)) => error.to_string(),
                     Err(_) => "Invitations were interrupted".into(),
                 };
                 let alert = adw::AlertDialog::builder()
-                    .heading("Group Created; Invitations Incomplete")
+                    .heading(failure_heading)
                     .body(&message)
                     .build();
                 alert.add_response("close", "Close");
@@ -364,13 +376,11 @@ impl Ui {
             .active(true)
             .build();
         fields.add(&address);
-        let browse = adw::ActionRow::builder()
-            .title("Browse Public Rooms")
-            .subtitle("Choose from rooms listed by this account’s group services")
-            .activatable(true)
-            .build();
-        browse.add_prefix(&gtk::Image::from_icon_name("system-search-symbolic"));
-        browse.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let browse = NavRow::new(
+            "system-search-symbolic",
+            "Browse Public Rooms",
+            Some("Choose from rooms listed by this account’s group services"),
+        );
         let weak = Rc::downgrade(self);
         let target = address.downgrade();
         browse.connect_activated(move |_| {

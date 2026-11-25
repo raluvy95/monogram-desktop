@@ -22,6 +22,39 @@ pub fn bare(value: &str) -> Result<String, String> {
     }
     Ok(jid.to_string())
 }
+/// The server's error condition and text from an error stanza, for example
+/// "service unavailable: Remote server not found [type=cancel]".
+fn stanza_error_reason(root: &Element) -> String {
+    let Some(error) = root.children().find(|child| child.name() == "error") else {
+        return String::new();
+    };
+    let condition = error
+        .children()
+        .find(|child| child.name() != "text")
+        .map(|child| child.name().replace('-', " "))
+        .unwrap_or_default();
+    let detail = error
+        .children()
+        .find(|child| child.name() == "text")
+        .map(|child| child.text())
+        .unwrap_or_default();
+    let reason = match (condition.is_empty(), detail.trim().is_empty()) {
+        (true, _) => detail,
+        (false, true) => condition,
+        (false, false) => format!("{condition}: {}", detail.trim()),
+    };
+    let mut info = Vec::new();
+    for name in ["type", "code"] {
+        if let Some(value) = error.attr(name) {
+            info.push(format!("{name}={}", crate::text_safety::visible(value, 40)));
+        }
+    }
+    if info.is_empty() { reason } else { format!("{reason} [{}]", info.join(" ")) }
+}
+/// A reason that came from a server says so, so it cannot pass for the app's own words.
+fn server_said(reason: String) -> String {
+    if reason.trim().is_empty() { reason } else { format!("the server said {reason}") }
+}
 fn bare_of(value: &str) -> String {
     value.split('/').next().unwrap_or("").to_string()
 }
@@ -377,12 +410,12 @@ pub fn text_stanza(peer: &str, text: &str, id: &str, reply: Option<(&str, &str, 
     let mut body = text.to_string();
     if let Some((reference, author, quote)) = reply {
         if !reference.is_empty() {
-            root.append_child(
-                Element::builder("reply", REPLY)
-                    .attr("id".try_into().expect("static XML attribute"), reference)
-                    .attr("to".try_into().expect("static XML attribute"), author)
-                    .build(),
-            );
+            let mut reply = Element::builder("reply", REPLY)
+                .attr("id".try_into().expect("static XML attribute"), reference);
+            if !author.is_empty() {
+                reply = reply.attr("to".try_into().expect("static XML attribute"), author);
+            }
+            root.append_child(reply.build());
             if !quote.is_empty() {
                 let quoted: String = quote.chars().take(512).collect();
                 let prefix = format!(
@@ -533,6 +566,7 @@ fn outgoing_content(peer: &str, message: &Message, quote: &str) -> Element {
 }
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    StoriesChanged { owner: String },
     Read {
         peer: String,
         id: String,
@@ -545,6 +579,12 @@ pub enum BackendEvent {
         peer: String,
         id: String,
         emoji: crate::packs::InlineEmoji,
+    },
+    /// The room message `id` went out without some members: each is `(address, why)`.
+    SentPartially {
+        peer: String,
+        id: String,
+        skipped: Vec<(String, String)>,
     },
     Uncertain {
         peer: String,
@@ -616,11 +656,22 @@ pub enum BackendEvent {
     BlockingChanged(crate::blocking::Snapshot),
     RoomBookmarks(Vec<crate::rooms::BookmarkInfo>),
     RoomPresence(crate::rooms::Presence),
+    /// The complete occupant list of a room; empty once the room is left.
+    RoomRoster {
+        room: String,
+        participants: Vec<crate::rooms::members::Participant>,
+    },
     RoomError(String),
     Presence {
         peer: String,
         online: bool,
         visible: bool,
+    },
+    /// The most reachable device's `show` and XEP-0319 idle time, or `None` when nothing is known
+    /// (offline, or presence not shared with us).
+    ContactStatus {
+        peer: String,
+        detail: Option<crate::contact_status::Detail>,
     },
     AvatarChanged {
         peer: String,
@@ -628,6 +679,7 @@ pub enum BackendEvent {
     },
     Typing {
         peer: String,
+        sender: String,
         composing: bool,
     },
     Message {
@@ -647,6 +699,8 @@ pub enum BackendEvent {
     Failed {
         peer: String,
         id: String,
+        /// Short human-readable cause, shown in the toast. Empty when unknown.
+        reason: String,
     },
     History {
         peer: String,
@@ -657,6 +711,7 @@ pub enum BackendEvent {
     Request(String),
     RequestCancelled(String),
     RoomInvitation(crate::rooms::invitations::Incoming),
+    RoomInvitationsAccepted(Vec<String>),
 }
 #[derive(Debug)]
 pub enum RoomPreparation {
@@ -666,18 +721,26 @@ pub enum RoomPreparation {
     },
     Probe {
         reply: tokio::sync::oneshot::Sender<crate::crypto::Result<Mode>>,
+        skip_unreachable: bool,
     },
     Review,
     PqReview,
 }
 #[derive(Debug)]
 pub enum Command {
+    Profile {peer:String,reply:tokio::sync::oneshot::Sender<Result<crate::profiles::Profile,&'static str>>},
+    StoriesFetch { peer: String, reply: tokio::sync::oneshot::Sender<crate::stories::Result<Vec<crate::stories::Entry>>> },
+    StoryPublish { entry: crate::stories::Entry, reply: tokio::sync::oneshot::Sender<crate::stories::Result<crate::stories::Entry>> },
+    StoryRetract { id: String, reply: tokio::sync::oneshot::Sender<crate::stories::Result<()>> },
     CryptoReady(bool),
     LegacyReady(bool),
     PqReady(bool),
     ChooseEncryption {
         peer: String,
         reply: tokio::sync::oneshot::Sender<crate::crypto::Result<crate::encryption_policy::Mode>>,
+        /// For a room: leave out members whose Legacy OMEMO keys cannot be used, as the user chose
+        /// with Send Anyway. The protocol is still chosen automatically.
+        skip_unreachable: bool,
     },
     Crypto(crate::crypto::service::Request),
     Legacy(crate::crypto::legacy::service::Request),
@@ -777,6 +840,10 @@ pub enum Command {
         nick: Option<String>,
     },
     RoomStableIds {
+        epoch: u64,
+        peer: String,
+    },
+    RoomHats {
         epoch: u64,
         peer: String,
     },
@@ -1022,6 +1089,10 @@ pub struct Session {
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl Session {
+    #[cfg(test)]
+    pub(crate) fn fixture_channel(tx: channel::UnboundedSender<Command>) -> Self {
+        Self { tx, cancel: None }
+    }
     pub fn start(
         config: Account,
         password: String,
@@ -1071,6 +1142,21 @@ impl Session {
                 loop{tokio::select!{
                     command=rx.recv()=>{match command{
                         None=>break,
+                        Some(Command::StoriesFetch{peer,reply})=>{
+                            if !online{let _=reply.send(Err(crate::stories::Error::Request(crate::iq::Error::Closed)));continue}
+                            let iq=crate::iq::Client::new(network.clone());
+                            tokio::spawn(async move{let mut reply=reply;let result=tokio::select!{result=crate::stories::fetch(&iq,&peer)=>result,_=reply.closed()=>return};let _=reply.send(result);});
+                        },
+                        Some(Command::StoryPublish{entry,reply})=>{
+                            if !online{let _=reply.send(Err(crate::stories::Error::Request(crate::iq::Error::Closed)));continue}
+                            let iq=crate::iq::Client::new(network.clone());let owner=owner.clone();
+                            tokio::spawn(async move{let mut reply=reply;let result=tokio::select!{result=crate::stories::publish(&iq,&owner,entry)=>result,_=reply.closed()=>return};let _=reply.send(result);});
+                        },
+                        Some(Command::StoryRetract{id,reply})=>{
+                            if !online{let _=reply.send(Err(crate::stories::Error::Request(crate::iq::Error::Closed)));continue}
+                            let iq=crate::iq::Client::new(network.clone());let owner=owner.clone();
+                            tokio::spawn(async move{let mut reply=reply;let result=tokio::select!{result=crate::stories::retract(&iq,&owner,&id)=>result,_=reply.closed()=>return};let _=reply.send(result);});
+                        },
                         Some(Command::CryptoReady(ready))=>crypto_ready=ready,
                         Some(Command::LegacyReady(ready))=>legacy_ready=ready,
                         Some(Command::PqReady(ready))=>pq_ready=ready,
@@ -1182,7 +1268,9 @@ impl Session {
                             loading_rooms=false;
                             match result {
                                 Ok(bookmarks)=>{
+                                    let accepted=bookmarks.iter().filter(|bookmark|bookmark.info().autojoin).map(|bookmark|bookmark.info().jid.clone()).collect();
                                     emit(BackendEvent::RoomBookmarks(rooms.import(bookmarks)));
+                                    emit(BackendEvent::RoomInvitationsAccepted(accepted));
                                     for peer in rooms.autojoin(){ let _=network.send(Command::JoinRoom{peer,nick:None}); }
                                 }
                                 Err(error)=>{
@@ -1194,6 +1282,9 @@ impl Session {
                         Some(Command::RoomBookmarksLoaded{..})=>{},
                         Some(Command::RoomStableIds{epoch,peer})=>{
                             if online && epoch==room_epoch { rooms.enable_stable_ids(peer); }
+                        },
+                        Some(Command::RoomHats{epoch,peer})=>{
+                            if online && epoch==room_epoch { rooms.enable_hats(peer); }
                         },
                         Some(Command::RoomMembersLoaded{epoch,peer,revision,result})=>{
                             if online && epoch==room_epoch {
@@ -1208,16 +1299,16 @@ impl Session {
                             match recipients {
                                 Ok(recipients)=>match purpose {
                                     RoomPreparation::Send{message,quote}=>{if message.mode()==Mode::Pq {pq.send(pq::Request::SendRoom{recipients,message,quote,epoch});}else{legacy.send(legacy::service::Request::SendRoom{recipients,message,quote,epoch});}},
-                                    RoomPreparation::Probe{reply}=>{
+                                    RoomPreparation::Probe{reply,skip_unreachable}=>{
                                         let (checked,response)=tokio::sync::oneshot::channel();
-                                        pq.send(pq::Request::ProbeRoom{recipients:recipients.clone(),reply:checked});
+                                        pq.send(pq::Request::ProbeRoom{recipients:recipients.clone(),reply:checked,skip_unreachable});
                                         let legacy_tx=legacy.sender();
                                         tokio::spawn(async move {
                                             let result=crate::encryption_policy::select(
                                                 async { response.await.unwrap_or(Err(crate::crypto::Error::Unavailable("OMEMO2 room check interrupted"))) },
                                                 async {
                                                     let (checked,response)=tokio::sync::oneshot::channel();
-                                                    legacy_tx.send(legacy::service::Request::ProbeRoom{recipients,reply:checked}).map_err(|_|crate::crypto::Error::Unavailable("Legacy room check interrupted"))?;
+                                                    legacy_tx.send(legacy::service::Request::ProbeRoom{recipients,reply:checked,skip_unreachable}).map_err(|_|crate::crypto::Error::Unavailable("Legacy room check interrupted"))?;
                                                     response.await.unwrap_or(Err(crate::crypto::Error::Unavailable("Legacy room check interrupted")))
                                                 },
                                             ).await;
@@ -1229,13 +1320,26 @@ impl Session {
                                 },
                                 Err(error)=>{
                                     let text=error.to_string();
+                                    // Send and Probe already tell the user through their own reply.
+                                    let mut report=true;
                                     match purpose {
-                                        RoomPreparation::Send{message,..}=>emit(BackendEvent::Failed{peer:peer.clone(),id:message.wire_id}),
-                                        RoomPreparation::Probe{reply}=>{let _=reply.send(Err(crate::crypto::Error::Unavailable("Could not establish complete room recipients. Join a nonanonymous members-only room and check its member permissions.")));},
+                                        RoomPreparation::Send{message,..}=>{report=false;emit(BackendEvent::Failed{peer:peer.clone(),id:message.wire_id,reason:text.clone()})},
+                                        RoomPreparation::Probe{reply,..}=>{
+                                            report=false;
+                                            // The server said the room has no complete member list (a public or
+                                            // anonymous room), so end-to-end encryption cannot exist there: send plain.
+                                            // Timeouts and other failures must never downgrade an encrypted room.
+                                            let _=reply.send(match error {
+                                                crate::rooms::Error::RecipientsUnavailable|crate::rooms::Error::NotPrivate|crate::rooms::Error::OccupantNotListed(_)=>Ok(Mode::Plain),
+                                                crate::rooms::Error::Request(crate::iq::Error::Timeout)=>Err(crate::crypto::Error::Unavailable("The room did not answer. Try again.")),
+                                                crate::rooms::Error::NotJoined|crate::rooms::Error::Joining=>Err(crate::crypto::Error::Unavailable("Join the room before sending.")),
+                                                _=>Err(crate::crypto::Error::Unavailable("Could not read the room's member list. Try again.")),
+                                            });
+                                        },
                                         RoomPreparation::Review=>emit(BackendEvent::LegacyReview{peer:peer.clone(),rows:vec![],errors:vec![text.clone()]}),
                                         RoomPreparation::PqReview=>emit(BackendEvent::PqDevices{peer:peer.clone(),devices:vec![]}),
                                     }
-                                    emit(BackendEvent::RoomError(text));
+                                    if report {emit(BackendEvent::RoomError(text));}
                                 },
                             }
                         },
@@ -1260,6 +1364,10 @@ impl Session {
                                 let _=network.send(Command::RoomJoinFinished{epoch,peer,ticket,result:result.map(|_|())});
                             });
                         },
+                        Some(Command::Profile{peer,reply})=>{
+                            let client=crate::iq::Client::new(network.clone());
+                            tokio::spawn(async move{let result=if online{crate::profiles::fetch(&client,&peer).await}else{Err("Connect to load profile details.")};let _=reply.send(result);});
+                        },
                         Some(Command::Avatar { peer, source, reply })=>{
                             let client = crate::iq::Client::new(network.clone());
                             tokio::spawn(async move {
@@ -1268,13 +1376,13 @@ impl Session {
                                 let _ = reply.send(result);
                             });
                         },
-                        Some(Command::ChooseEncryption{peer,reply})=>{
+                        Some(Command::ChooseEncryption{peer,reply,skip_unreachable})=>{
                             if !online {
                                 let _ = reply.send(Err(crate::crypto::Error::Unavailable("Connection interrupted")));
                                 continue;
                             }
                             if rooms.known(&peer) {
-                                prepare_room(&rooms,peer,room_epoch,RoomPreparation::Probe{reply},&network);
+                                prepare_room(&rooms,peer,room_epoch,RoomPreparation::Probe{reply,skip_unreachable},&network);
                                 continue;
                             }
                             let (checked, first) = tokio::sync::oneshot::channel();
@@ -1299,16 +1407,16 @@ impl Session {
                             let to=if payload.is("query","http://jabber.org/protocol/disco#info") {contacts.available_resource(&to).unwrap_or(to)} else {to};if let Some(root)=iq.start(to,kind,payload,reply){let id=root.attr("id").unwrap().to_string();if !send(&mut client,root).await{iq.fail(&id)}}
                         },
                         Some(Command::Send{peer,message,quote})=>{
-                            if blocking.blocked(&peer){emit(BackendEvent::ContactAccessError("Unblock this address before sending messages".into()));emit(BackendEvent::Failed{peer,id:message.wire_id});continue}
-                            if !online || message.unavailable || message.upload.is_some() || message.attachment.as_ref().is_some_and(|file|!file.valid_outgoing(message.encrypted)||message.poll.is_some()||message.action.is_some()){emit(BackendEvent::Failed{peer,id:message.wire_id});continue}
+                            if blocking.blocked(&peer){emit(BackendEvent::Failed{peer,id:message.wire_id,reason:"Unblock this address before sending messages".into()});continue}
+                            if !online || message.unavailable || message.upload.is_some() || message.attachment.as_ref().is_some_and(|file|!file.valid_outgoing(message.encrypted)||message.poll.is_some()||message.action.is_some()){emit(BackendEvent::Failed{peer,id:message.wire_id,reason:if !online{"you are offline".into()}else if message.unavailable{"the message is unavailable".into()}else if message.upload.is_some(){"the attachment is still uploading".into()}else{"the attachment or message is not valid to send".into()}});continue}
                             if rooms.known(&peer) {
                                 if matches!(message.mode(),Mode::Legacy|Mode::Pq) {
                                     prepare_room(&rooms,peer,room_epoch,RoomPreparation::Send{message,quote},&network);
                                     continue;
                                 }
                                 match rooms.outgoing(&peer,&message,&quote){
-                                    Ok(root)=>{let ok=send(&mut client,root).await;emit(if ok{BackendEvent::Sent{peer,id:message.wire_id}}else{BackendEvent::Failed{peer,id:message.wire_id}});}
-                                    Err(error)=>{emit(BackendEvent::RoomError(error.to_string()));emit(BackendEvent::Failed{peer,id:message.wire_id});}
+                                    Ok(root)=>{let ok=send(&mut client,root).await;emit(if ok{BackendEvent::Sent{peer,id:message.wire_id}}else{BackendEvent::Failed{peer,id:message.wire_id,reason:"the server connection dropped".into()}});}
+                                    Err(error)=>{emit(BackendEvent::Failed{peer,id:message.wire_id,reason:error.to_string()});}
                                 }
                                 continue;
                             }
@@ -1319,7 +1427,7 @@ impl Session {
                                 Mode::Plain => {},
                             }
                             let root=outgoing(&peer,&message,&quote);
-                            let ok=send(&mut client,root).await;emit(if ok{BackendEvent::Sent{peer,id:message.wire_id}}else{BackendEvent::Failed{peer,id:message.wire_id}});
+                            let ok=send(&mut client,root).await;emit(if ok{BackendEvent::Sent{peer,id:message.wire_id}}else{BackendEvent::Failed{peer,id:message.wire_id,reason:"the server connection dropped".into()}});
                         },
                         Some(Command::PreviewHistory{peer,start,end,reply})=>{
                             if reply.is_closed(){continue}
@@ -1355,7 +1463,12 @@ impl Session {
                                 emit(archive::failed(page.peer));
                             }
                         },
-                        Some(Command::Typing{peer,composing})=>{if online{send(&mut client,Element::builder("message",NS).attr("type".try_into().expect("static XML attribute"),"chat").attr("to".try_into().expect("static XML attribute"),peer).append(el(if composing{"composing"}else{"paused"},"http://jabber.org/protocol/chatstates")).build()).await;}},
+                        Some(Command::Typing{peer,composing})=>{
+                            if online && (!rooms.known(&peer) || rooms.is_joined(&peer)) {
+                                let kind=if rooms.known(&peer){"groupchat"}else{"chat"};
+                                send(&mut client,Element::builder("message",NS).attr("type".try_into().expect("static XML attribute"),kind).attr("to".try_into().expect("static XML attribute"),peer).append(el(if composing{"composing"}else{"paused"},crate::chat_states::NS)).append(el("no-store","urn:xmpp:hints")).build()).await;
+                            }
+                        },
                         Some(Command::BlockingList{reply})=>{
                             if reply.is_closed(){continue}
                             if !online {let snapshot=blocking.snapshot();let _=reply.send(if snapshot.jids.is_some(){Ok(snapshot)}else{Err("Reconnect to load blocked contacts".into())});continue}
@@ -1421,11 +1534,12 @@ impl Session {
                     }},
                     event=client.next()=>{match event{
                         Some(Event::Online)=>{online=true;let block_epoch=blocking.online();let(manager,blocking_network)=(blocking.clone(),network.clone());tokio::spawn(async move{if let Err(error)=manager.refresh(&blocking_network,block_epoch).await{if manager.valid(block_epoch){eprintln!("Background blocked contacts refresh: {error}")}}});let contact_epoch=contacts.online();let (manager,contact_network)=(contacts.clone(),network.clone());tokio::spawn(async move{if let Err(error)=manager.refresh(&contact_network,contact_epoch).await{if manager.valid(contact_epoch){manager.error(error)}}});room_epoch=room_epoch.wrapping_add(1);preview_epoch.send_replace(room_epoch);let _=network.send(Command::LoadRoomBookmarks);crypto.send(modern::Request::Online(true));legacy.send(legacy::service::Request::Online(true));pq.send(pq::Request::Online(true));emit(BackendEvent::Status{online:true,error:false,text:"Connected · TLS".into()});send(&mut client,el("presence",NS)).await;send(&mut client,Element::builder("iq",NS).attr("type".try_into().expect("static XML attribute"),"set").attr("id".try_into().expect("static XML attribute"),"carbons").append(el("enable","urn:xmpp:carbons:2")).build()).await;},
-                        Some(Event::Disconnected(error))=>{#[cfg(test)] eprintln!("fixture disconnect: {error:?}");online=false;preview_epoch.send_modify(|epoch|*epoch=epoch.wrapping_add(1));contacts.disconnect();blocking.disconnect();contact_queries.clear();room_jobs.disconnect();rooms.disconnect();loading_rooms=false;subscribing_rooms=false;crypto_ready=false;legacy_ready=false;pq_ready=false;crypto.send(modern::Request::Online(false));legacy.send(legacy::service::Request::Online(false));pq.send(pq::Request::Online(false));iq.disconnect();for (_,job) in preview_jobs.drain(){finish_preview_history(&mut preview_active,job,false);}preview_active.clear();mam.clear();handshake=std::time::Instant::now();let fatal = fatal_error(&error);emit(BackendEvent::Status{online:false,error:fatal,text:if fatal{"Sign-in failed. Check credentials, TLS certificate and server configuration."}else{"Disconnected. Reconnecting…"}.into()});if fatal{break}},
+                        Some(Event::Disconnected(error))=>{#[cfg(test)] eprintln!("fixture disconnect: {error:?}");online=false;preview_epoch.send_modify(|epoch|*epoch=epoch.wrapping_add(1));contacts.disconnect();blocking.disconnect();contact_queries.clear();room_jobs.disconnect();rooms.disconnect();loading_rooms=false;subscribing_rooms=false;crypto_ready=false;legacy_ready=false;pq_ready=false;crypto.send(modern::Request::Online(false));legacy.send(legacy::service::Request::Online(false));pq.send(pq::Request::Online(false));iq.disconnect();for (_,job) in preview_jobs.drain(){finish_preview_history(&mut preview_active,job,false);}preview_active.clear();mam.clear();handshake=std::time::Instant::now();let fatal = fatal_error(&error);eprintln!("Monogram connection lost: auto_retry={}; {}",!fatal,crate::message_failures::safe_log_detail(&error.to_string()));emit(BackendEvent::Status{online:false,error:fatal,text:if fatal{"Sign-in failed. Check credentials, TLS certificate and server configuration."}else{"Disconnected. Reconnecting…"}.into()});if fatal{break}},
                         None=>break,
                         Some(Event::Stanza(stanza))=>{
                             let root:Element=stanza.into();if let Some(reply)=blocking.push(&root){send(&mut client,reply).await;continue}if iq.receive(&root,&owner){if let Some((epoch,_,serial))=contact_queries.remove(root.attr("id").unwrap_or("")){if root.attr("type")==Some("result")&&root.children().count()==1{if let Some(query)=root.get_child("query",crate::contact_access::ROSTER){if let Err(error)=crate::contact_access::parse_roster(query,true).and_then(|update|contacts.finish_full(epoch,serial,update)){contacts.clear_full(epoch,Some(serial));if contacts.valid(epoch){contacts.error(error)}}}else{contacts.clear_full(epoch,Some(serial));}}else{contacts.clear_full(epoch,Some(serial));}}continue}let from=root.attr("from").unwrap_or("");
                             if root.is("message",NS){
+                                if let Some(story_owner)=crate::stories::changed(&root,&owner){emit(BackendEvent::StoriesChanged{owner:story_owner});}
                                 rooms.configuration_changed(&root);
                                 refresh_room_members(&mut rooms,&bare_of(from),room_epoch,&network);
                                 if crate::rooms::bookmark_changed(&root,&owner) { let _=network.send(Command::LoadRoomBookmarks); }
@@ -1466,6 +1580,7 @@ impl Session {
                                     }
                                     continue;
                                 }
+                                if let Some(event)=typing_event(&rooms,&root,&owner){emit(event);}
                                 if root.attr("type")==Some("groupchat"){
                                     deliver_room(&rooms,&legacy,&pq,&emit,&root,&owner,None);
                                     continue;
@@ -1473,7 +1588,7 @@ impl Session {
                                 if crate::avatar::pep_changed(&root) && bare(from).ok().as_deref()==Some(from) {
                                     emit(BackendEvent::AvatarChanged{peer:from.into(),hint:None});
                                 }
-                                if root.attr("type")==Some("error"){emit(BackendEvent::Failed{peer:bare_of(from),id:root.attr("id").unwrap_or("").into()});continue}
+                                if root.attr("type")==Some("error"){emit(BackendEvent::Failed{peer:bare_of(from),id:root.attr("id").unwrap_or("").into(),reason:server_said(stanza_error_reason(&root))});continue}
                                 if let Some(notice)=crate::read_markers::incoming_receipt(&root,&owner).filter(|n|!rooms.known(&n.peer)){emit(BackendEvent::Receipt{peer:notice.peer,id:notice.id});}
                                 if let Some(notice)=crate::read_markers::incoming(&root,&owner).filter(|n|!rooms.known(&n.peer)){emit(BackendEvent::Read{peer:notice.peer,id:notice.id});}
                                 let mut carbon_wrappers=root.children().filter(|c|c.is("received","urn:xmpp:carbons:2")||c.is("sent","urn:xmpp:carbons:2"));
@@ -1490,7 +1605,6 @@ impl Session {
                                     }continue
                                 }
                                 if let Some((_peer,message,historical))=normalize(&root,&owner,None){let receipt_to=(!historical&&!message.own&&!message.wire_id.is_empty()&&root.get_child("request","urn:xmpp:receipts").is_some()).then(||from.to_string());deliver(&crypto,&legacy,&pq,&emit,&root,&owner,None,historical,receipt_to);}
-                                if let Some(composing)=crate::chat_states::incoming(&root){emit(BackendEvent::Typing{peer:bare_of(from),composing});}
                             }else if root.is("presence",NS){
                                 let room_presence=rooms.presence(&root);
                                 room_jobs.changed(&rooms,&bare_of(from));
@@ -1542,11 +1656,11 @@ impl Session {
                                     }
                                     continue;
                                 }
-                                if root.attr("type")==Some("get")&&root.get_child("query","http://jabber.org/protocol/disco#info").is_some(){let mut query=el("query","http://jabber.org/protocol/disco#info");for ns in [crate::legacy_inline::NS,"urn:xmpp:receipts",crate::read_markers::NS,REPLY,SID,"http://jabber.org/protocol/chatstates",crate::message_actions::CORRECT,crate::message_actions::REACTIONS,crate::message_actions::RETRACT,crate::polls::NS,crate::forwarding::NS,crate::file_share::NS,crate::rooms::invitations::DIRECT]{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().expect("static XML attribute"),ns).build());}if legacy_ready{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().unwrap(),legacy::NS).build());}if crypto_ready{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().unwrap(),"urn:xmpp:omemo:2").build());}if pq_ready {for suffix in ["",":devices+notify",":bundles+notify",":pqxdh",":spqr",":bundle-v4",":kex-auth"]{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().unwrap(),format!("{}{suffix}",crate::crypto::pq::NS)).build());}}send(&mut client,Element::builder("iq",NS).attr("to".try_into().expect("static XML attribute"),from).attr("type".try_into().expect("static XML attribute"),"result").attr("id".try_into().expect("static XML attribute"),id).append(query).build()).await;}
+                                if root.attr("type")==Some("get")&&root.get_child("query","http://jabber.org/protocol/disco#info").is_some(){let mut query=el("query","http://jabber.org/protocol/disco#info");for ns in [crate::stories::SOCIAL,crate::stories::NODE,"urn:xmpp:pubsub-social-feed:stories:0+notify",crate::packs::emoji_markup::NS,crate::legacy_inline::NS,"urn:xmpp:receipts",crate::read_markers::NS,REPLY,SID,"http://jabber.org/protocol/chatstates",crate::message_actions::CORRECT,crate::message_actions::REACTIONS,crate::message_actions::RETRACT,crate::polls::NS,crate::forwarding::NS,crate::file_share::NS,crate::file_share::VOICE,crate::rooms::invitations::DIRECT]{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().expect("static XML attribute"),ns).build());}if legacy_ready{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().unwrap(),legacy::NS).build());}if crypto_ready{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().unwrap(),"urn:xmpp:omemo:2").build());}if pq_ready {for suffix in ["",":devices+notify",":bundles+notify",":pqxdh",":spqr",":bundle-v4",":kex-auth"]{query.append_child(Element::builder("feature","http://jabber.org/protocol/disco#info").attr("var".try_into().unwrap(),format!("{}{suffix}",crate::crypto::pq::NS)).build());}}send(&mut client,Element::builder("iq",NS).attr("to".try_into().expect("static XML attribute"),from).attr("type".try_into().expect("static XML attribute"),"result").attr("id".try_into().expect("static XML attribute"),id).append(query).build()).await;}
                             }
                         }
                     }},
-                    _=timer.tick()=>{if online&&displayed_policy.enabled&&marker_tick.elapsed()>=Duration::from_secs(5){marker_tick=std::time::Instant::now();let _=network.send(Command::FlushDisplayed);}iq.expire();contact_queries.retain(|_,(epoch,started,serial)|{let keep=contacts.valid(*epoch)&&started.elapsed()<Duration::from_secs(25);if !keep{contacts.clear_full(*epoch,Some(*serial));}keep});for stanza in room_jobs.expire(&mut rooms){let peer=bare_of(stanza.attr("to").unwrap_or(""));send(&mut client,stanza).await;emit(BackendEvent::RoomPresence(rooms.status(&peer)));}for presence in rooms.expire(){emit(BackendEvent::RoomPresence(presence));}if !online&&handshake.elapsed()>Duration::from_secs(45){emit(BackendEvent::Status{online:false,error:true,text:"Connection timed out. Check the account settings.".into()});break}mam.retain(|id,page| {
+                    _=timer.tick()=>{if online&&displayed_policy.enabled&&marker_tick.elapsed()>=Duration::from_secs(5){marker_tick=std::time::Instant::now();let _=network.send(Command::FlushDisplayed);}iq.expire();contact_queries.retain(|_,(epoch,started,serial)|{let keep=contacts.valid(*epoch)&&started.elapsed()<Duration::from_secs(25);if !keep{contacts.clear_full(*epoch,Some(*serial));}keep});for stanza in room_jobs.expire(&mut rooms){let peer=bare_of(stanza.attr("to").unwrap_or(""));send(&mut client,stanza).await;emit(BackendEvent::RoomPresence(rooms.status(&peer)));}for presence in rooms.expire(){emit(BackendEvent::RoomPresence(presence));}for (room,participants) in rooms.take_roster_changes(){emit(BackendEvent::RoomRoster{room,participants});}if !online&&handshake.elapsed()>Duration::from_secs(45){emit(BackendEvent::Status{online:false,error:true,text:"Connection timed out. Check the account settings.".into()});break}mam.retain(|id,page| {
                         let context_expired=preview_jobs.get(id).is_some_and(|job|job.reply.is_closed()||job.epoch!=room_epoch||job.deadline<=std::time::Instant::now());
                         let expired=page.started.elapsed()>Duration::from_secs(20)||context_expired;
                         if expired {if let Some(job)=preview_jobs.remove(id){finish_preview_history(&mut preview_active,job,false);}else{emit(archive::failed(page.peer.clone()));}}
@@ -1573,6 +1687,22 @@ impl Drop for Session {
         }
     }
 }
+fn typing_event(rooms: &crate::rooms::Rooms, xml: &Element, owner: &str) -> Option<BackendEvent> {
+    let composing = crate::chat_states::incoming(xml)?;
+    let (peer, sender) = if xml.attr("type") == Some("groupchat") {
+        rooms.typing_sender(xml)?
+    } else {
+        let sender = xml.attr("from")?.parse::<Jid>().ok()?;
+        let peer = sender.to_bare().to_string();
+        if peer == owner || rooms.known(&peer)
+            || xml.attr("to").is_some_and(|to| to.parse::<Jid>().ok()
+                .is_none_or(|to| to.to_bare().as_str() != owner))
+        { return None; }
+        (peer, sender.to_string())
+    };
+    Some(BackendEvent::Typing { peer, sender, composing })
+}
+
 fn fatal_error(error: &tokio_xmpp::Error) -> bool {
     use tokio_xmpp::Error;
     match error {
@@ -1797,6 +1927,60 @@ async fn send(client: &mut Client, root: Element) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typing_routes_live_direct_and_joined_room_senders() {
+        let owner = "alice@example.invalid";
+        let room = "room@conference.example.invalid";
+        let mut rooms = crate::rooms::Rooms::new(owner.into());
+        let xml = |kind: &str, from: &str, to: &str, extra: &str| -> Element {
+            format!("<message xmlns='jabber:client' {kind} from='{from}' to='{to}'><composing xmlns='http://jabber.org/protocol/chatstates'/>{extra}</message>").parse().unwrap()
+        };
+        for kind in ["type='chat'", "type='normal'", ""] {
+            let event = typing_event(&rooms, &xml(kind,"bob@example.invalid/phone",owner,""), owner);
+            assert!(matches!(event,Some(BackendEvent::Typing {peer,sender,composing:true}) if peer=="bob@example.invalid" && sender=="bob@example.invalid/phone"));
+        }
+        assert!(typing_event(&rooms,&xml("type='chat'",owner,owner,""),owner).is_none());
+        assert!(typing_event(&rooms,&xml("type='chat'","bob@example.invalid/phone","other@example.invalid",""),owner).is_none());
+        let actor = format!("{room}/Bob");
+        assert!(typing_event(&rooms,&xml("type='groupchat'",&actor,owner,""),owner).is_none());
+        rooms.join(room,Some("me")).unwrap();
+        let presence: Element = format!("<presence xmlns='jabber:client' from='{room}/me' to='{owner}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='participant'/><status code='110'/></x></presence>").parse().unwrap();
+        assert!(rooms.presence(&presence).unwrap().joined);
+        assert!(matches!(typing_event(&rooms,&xml("type='groupchat'",&actor,owner,""),owner),Some(BackendEvent::Typing {peer,sender,composing:true}) if peer==room && sender==actor));
+        // Room states use the occupant resource even when real JIDs are undisclosed.
+        for (kind,from,to,extra) in [
+            ("type='groupchat'",format!("{room}/me"),owner,""),
+            ("type='groupchat'",room.into(),owner,""),
+            ("type='chat'",actor.clone(),owner,""),
+            ("type='groupchat'",actor.clone(),"other@example.invalid",""),
+            ("type='groupchat'",actor.clone(),owner,"<delay xmlns='urn:xmpp:delay'/>"),
+        ] {
+            assert!(typing_event(&rooms,&xml(kind,&from,to,extra),owner).is_none());
+        }
+        rooms.disconnect();
+        assert!(typing_event(&rooms,&xml("type='groupchat'",&actor,owner,""),owner).is_none());
+    }
+
+    #[test]
+    fn failed_sends_name_the_servers_error_condition_and_text() {
+        let error = |inner: &str| -> Element {
+            format!("<message xmlns='jabber:client' type='error' id='m1'>{inner}</message>").parse().unwrap()
+        };
+        let stanzas = "urn:ietf:params:xml:ns:xmpp-stanzas";
+        assert_eq!(
+            stanza_error_reason(&error(&format!("<error type='cancel'><service-unavailable xmlns='{stanzas}'/><text xmlns='{stanzas}'>Remote server not found</text></error>"))),
+            "service unavailable: Remote server not found [type=cancel]"
+        );
+        assert_eq!(
+            stanza_error_reason(&error(&format!("<error type='auth' code='403'><forbidden xmlns='{stanzas}'/></error>"))),
+            "forbidden [type=auth code=403]"
+        );
+        assert_eq!(
+            stanza_error_reason(&error(&format!("<error><text xmlns='{stanzas}'>Only text</text></error>"))),
+            "Only text"
+        );
+        assert_eq!(stanza_error_reason(&error("")), "", "no error element means no reason");
+    }
     #[test]
     fn pq_messages_are_visible_without_trusting_outside_content() {
         for body in ["", "<body>Untrusted outside text</body><x xmlns='jabber:x:oob'><url>https://example.org/fake.png</url></x>"] {

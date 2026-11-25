@@ -203,6 +203,10 @@ struct SharedQuickRow {
 }
 
 struct EmojiSurface {
+    /// Until the first expansion the full catalog list is not built. The reaction picker is
+    /// created on every message right-click, and rebuilding every category there made the
+    /// context menu appear late.
+    lazy: Cell<bool>,
     ui: Weak<Ui>,
     root: gtk::Box,
     categories: gtk::Box,
@@ -233,6 +237,32 @@ impl EmojiSurface {
         ui: &Rc<Ui>,
         columns: u32,
         height: Option<i32>,
+        activate: impl Fn(&Rc<Ui>, &str) + 'static,
+    ) -> Rc<Self> {
+        Self::build(ui, columns, height, false, activate)
+    }
+
+    /// Like `new`, but the catalog list is only built by `ensure_built` (first expansion).
+    fn new_lazy(
+        ui: &Rc<Ui>,
+        columns: u32,
+        height: Option<i32>,
+        activate: impl Fn(&Rc<Ui>, &str) + 'static,
+    ) -> Rc<Self> {
+        Self::build(ui, columns, height, true, activate)
+    }
+
+    fn ensure_built(self: &Rc<Self>) {
+        if self.lazy.replace(false) {
+            self.refresh();
+        }
+    }
+
+    fn build(
+        ui: &Rc<Ui>,
+        columns: u32,
+        height: Option<i32>,
+        lazy: bool,
         activate: impl Fn(&Rc<Ui>, &str) + 'static,
     ) -> Rc<Self> {
         let surface = Rc::new_cyclic(|surface: &Weak<EmojiSurface>| {
@@ -296,6 +326,7 @@ impl EmojiSurface {
             let favorite_preview = favorite_order::Preview::new(&scrolling);
             root.append(&favorite_preview);
             Self {
+                lazy: Cell::new(lazy),
                 ui: Rc::downgrade(ui),
                 root,
                 categories,
@@ -342,7 +373,9 @@ impl EmojiSurface {
             }
         });
         surface.populate_categories();
-        surface.refresh();
+        if !lazy {
+            surface.refresh();
+        }
         surface
     }
 
@@ -507,6 +540,9 @@ impl EmojiSurface {
                 previous = Some(button.clone());
             }
         }
+        if self.lazy.get() {
+            return;
+        }
         let mut sections = Vec::new();
         if searching {
             sections.push((
@@ -628,7 +664,7 @@ impl EmojiSurface {
         alternate.set_propagation_phase(gtk::PropagationPhase::Capture);
         let surface = Rc::downgrade(self);
         let emoji = value.clone();
-        let skip_activation = alternate_activation;
+        let skip_activation = alternate_activation.clone();
         alternate.connect_pressed(move |gesture, _, _, _| {
             if !gesture
                 .current_event_state()
@@ -669,16 +705,8 @@ impl EmojiSurface {
             }
         });
         button.add_controller(secondary);
-        let long_press = gtk::GestureLongPress::new();
-        let surface = Rc::downgrade(self);
-        let target = button.downgrade();
-        let emoji = value.clone();
-        long_press.connect_pressed(move |_, x, y| {
-            if let (Some(surface), Some(button)) = (surface.upgrade(), target.upgrade()) {
-                surface.emoji_options(&button, &emoji, x, y);
-            }
-        });
-        button.add_controller(long_press);
+        if let Some(ui)=self.ui.upgrade(){crate::picker_zoom::attach(&ui,&button,alternate_activation);}
+
         let keys = gtk::EventControllerKey::new();
         let surface = Rc::downgrade(self);
         let target = button.downgrade();
@@ -841,7 +869,7 @@ pub(crate) fn mobile_emoji_icon(icon: &str, size: i32) -> gtk::Image {
         size,
         true,
     ) {
-        picture.set_from_pixbuf(Some(&pixbuf));
+        picture.set_paintable(Some(&crate::widgets::texture_from_pixbuf(&pixbuf)));
     }
     picture
 }
@@ -1244,6 +1272,7 @@ impl ReactionPicker {
             animation.pause();
         }
         if expanded {
+            self.surface.ensure_built();
             self.capture_collapsed_radius();
         }
         if !expanded {
@@ -1416,7 +1445,7 @@ impl Ui {
             .collect::<Vec<_>>();
         let popup = popover.downgrade();
         let id = message.id.clone();
-        let surface = EmojiSurface::new(self, 8, Some(330), move |ui, emoji| {
+        let surface = EmojiSurface::new_lazy(self, 8, Some(330), move |ui, emoji| {
             if let Some(popup) = popup.upgrade() {
                 popup.popdown();
                 popup.unparent();

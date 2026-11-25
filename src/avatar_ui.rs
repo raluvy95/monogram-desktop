@@ -146,7 +146,7 @@ fn trim_disk_cache(dir: &Path) {
 #[derive(Default)]
 pub struct Avatars {
     widgets: HashMap<String, (Source, Vec<glib::WeakRef<adw::Avatar>>)>,
-    cache: HashMap<String, (Instant, Option<gdk::Texture>)>,
+    pub(crate) cache: HashMap<String, (Instant, Option<gdk::Texture>)>,
     fetching: HashMap<String, (u64, gio::Cancellable)>,
     hints: HashMap<String, String>,
     invalidated: HashSet<String>,
@@ -211,6 +211,7 @@ impl Ui {
         if owner.is_empty() || chat.id == "saved" || chat.jid.is_empty() {
             return avatar;
         }
+        if let Some(texture)=self.local_contact_avatars.borrow().get(&chat.jid) { avatar.set_custom_image(Some(texture)); return avatar; }
         let mut avatars = self.avatars.borrow_mut();
         if let Some((_, texture)) = avatars.cache.get(&chat.jid) {
             avatar.set_custom_image(texture.as_ref());

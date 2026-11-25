@@ -45,6 +45,7 @@ pub struct Job {
     pub cancel: AtomicBool,
     pub source: gio::Cancellable,
     pub phase: Mutex<Phase>,
+    pub diagnostic: Mutex<Option<String>>,
 }
 impl Default for Job {
     fn default() -> Self {
@@ -52,6 +53,7 @@ impl Default for Job {
             cancel: AtomicBool::new(false),
             source: gio::Cancellable::new(),
             phase: Mutex::new(Phase::Discovering),
+            diagnostic: Mutex::new(None),
         }
     }
 }
@@ -570,76 +572,130 @@ async fn put_wire(
     job: Arc<Job>,
     ack_timeout: Duration,
 ) -> Result<()> {
+    job.check()?;
+    *job.phase.lock().unwrap() = Phase::Uploading {
+        bytes: 0,
+        total: wire.size,
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let (finished, consumed) = tokio::sync::oneshot::channel();
+    let input = Input {
+        file: wire
+            .input
+            .reopen()
+            .map_err(|_| "Upload wire snapshot unavailable")?
+            .0,
+        size: wire.size,
+        bytes: 0,
+        cipher: None,
+        hash: Hasher::new(MessageDigest::sha256()).map_err(|_| "Hash unavailable")?,
+        expected: wire.hash.clone(),
+        done: done.clone(),
+        job: job.clone(),
+        report_progress: true,
+        finished: Some(finished),
+    };
+    let stream = futures_util::stream::try_unfold(input, |mut input| async move {
+        input
+            .next()
+            .map(|chunk| chunk.map(|chunk| (chunk, input)))
+            .map_err(std::io::Error::other)
+    });
+    let response = client
+        .put(slot.put.clone())
+        .headers(slot.headers.clone())
+        .header(reqwest::header::CONTENT_TYPE, mime)
+        .header(reqwest::header::CONTENT_LENGTH, wire.size)
+        .body(reqwest::Body::wrap_stream(stream))
+        .send();
+    tokio::pin!(response);
+    // Reqwest's response-header read timeout also runs while the body is being
+    // uploaded. Watch upload progress here; start the acknowledgement clock later.
+    let stalled=async {
+        let mut timer=tokio::time::interval(Duration::from_secs(1));
+        let mut previous=0;let mut changed=std::time::Instant::now();
+        loop {
+            timer.tick().await;
+            let bytes=match *job.phase.lock().unwrap(){Phase::Uploading{bytes,..}=>bytes,Phase::Waiting=>wire.size,_=>0};
+            if bytes!=previous {previous=bytes;changed=std::time::Instant::now();}
+            if job.cancel.load(Ordering::Acquire) || changed.elapsed()>=Duration::from_secs(30){break;}
+        }
+    };
+    let result = tokio::select! {
+        result = &mut response => Some(result),
+        _ = stalled => None,
+        consumed = consumed => {
+            if consumed.is_ok() {
+                tokio::time::timeout(ack_timeout, &mut response).await.ok()
+            } else { Some(response.await) }
+        }
+    };
+    job.check()?;
+    *job.diagnostic.lock().unwrap() = Some(match &result {
+        Some(Ok(response)) => format!("HTTP PUT status={}; body_complete={}", response.status().as_u16(), done.load(Ordering::Acquire)),
+        Some(Err(error)) => {
+            let mut detail = format!("HTTP PUT response; timeout={}; connect={}; body={}; request={}; body_complete={}", error.is_timeout(), error.is_connect(), error.is_body(), error.is_request(),done.load(Ordering::Acquire));
+            let mut cause = std::error::Error::source(error);
+            for _ in 0..4 {
+                let Some(error) = cause else { break };
+                detail.push_str("; cause=");
+                detail.push_str(&crate::message_failures::safe_detail(&error.to_string()));
+                cause = error.source();
+            }
+            detail
+        },
+        None if done.load(Ordering::Acquire) => "HTTP PUT acknowledgement deadline exceeded after body transmission".into(),
+        None => "HTTP PUT body stalled without upload progress".into(),
+    });
+    match result {
+        Some(Ok(response)) if response.status().as_u16() == 409 => Err("Upload slot conflict"),
+        Some(Ok(response))
+            if [200, 201, 204].contains(&response.status().as_u16())
+                && done.load(Ordering::Acquire) =>
+        {
+            Ok(())
+        }
+        Some(Ok(_)) => Err("Upload was not accepted"),
+        Some(Err(error))
+            if !error.is_body()
+                && (error.is_timeout() || error.is_connect() || error.is_request()) =>
+        {
+            Err("Upload response interrupted")
+        }
+        None => Err("Upload response interrupted"),
+        _ => Err("HTTPS upload failed"),
+    }
+}
+async fn put_with_slots<F, Fut>(
+    client: &reqwest::Client,
+    mime: &str,
+    wire: &Wire,
+    job: Arc<Job>,
+    ack_timeout: Duration,
+    mut next: F,
+) -> Result<Slot>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Slot>>,
+{
+    let mut used = None;
     for attempt in 0..2 {
         job.check()?;
-        if attempt == 1 {
+        if attempt > 0 {
             *job.phase.lock().unwrap() = Phase::Reconnecting;
-        } else {
-            *job.phase.lock().unwrap() = Phase::Uploading {
-                bytes: 0,
-                total: wire.size,
-            };
         }
-        let done = Arc::new(AtomicBool::new(false));
-        let (finished, consumed) = tokio::sync::oneshot::channel();
-        let input = Input {
-            file: wire
-                .input
-                .reopen()
-                .map_err(|_| "Upload wire snapshot unavailable")?
-                .0,
-            size: wire.size,
-            bytes: 0,
-            cipher: None,
-            hash: Hasher::new(MessageDigest::sha256()).map_err(|_| "Hash unavailable")?,
-            expected: wire.hash.clone(),
-            done: done.clone(),
-            job: job.clone(),
-            report_progress: true,
-            finished: Some(finished),
-        };
-        let stream = futures_util::stream::try_unfold(input, |mut input| async move {
-            input
-                .next()
-                .map(|chunk| chunk.map(|chunk| (chunk, input)))
-                .map_err(std::io::Error::other)
-        });
-        let response = client
-            .put(slot.put.clone())
-            .headers(slot.headers.clone())
-            .header(reqwest::header::CONTENT_TYPE, mime)
-            .header(reqwest::header::CONTENT_LENGTH, wire.size)
-            .body(reqwest::Body::wrap_stream(stream))
-            .send();
-        tokio::pin!(response);
-        let result = tokio::select! {
-            result = &mut response => Some(result),
-            consumed = consumed => {
-                if consumed.is_ok() && attempt == 0 {
-                    tokio::time::timeout(ack_timeout, &mut response).await.ok()
-                } else { Some(response.await) }
-            }
-        };
+        let slot = next(attempt).await?;
         job.check()?;
-        match result {
-            Some(Ok(response)) => {
-                return if [200, 201, 204].contains(&response.status().as_u16())
-                    && done.load(Ordering::Acquire)
-                {
-                    Ok(())
-                } else {
-                    Err("Upload was not accepted")
-                };
-            }
-            Some(Err(error))
-                if attempt == 0
-                    && !error.is_body()
-                    && (error.is_timeout() || error.is_connect() || error.is_request()) => {}
-            None if attempt == 0 => {}
-            _ => return Err("HTTPS upload failed"),
+        if used.as_ref() == Some(&slot.put) {
+            return Err("Upload server reused an occupied slot. Retry later.");
         }
-        // RFC 9110 section 9.2.2: repeat this PUT once, to the same URI with identical bytes.
-        eprintln!("Monogram upload response stalled; reconnecting once");
+        match put_wire(client, &slot, mime, wire, job.clone(), ack_timeout).await {
+            Ok(()) => return Ok(slot),
+            Err("Upload response interrupted" | "Upload slot conflict") if attempt == 0 => {
+                used = Some(slot.put);
+            }
+            Err(reason) => return Err(reason),
+        }
     }
     Err("HTTPS upload failed")
 }
@@ -657,7 +713,10 @@ pub async fn run(
     job: Arc<Job>,
 ) -> Result<Uploaded> {
     let encrypted = mode.encrypted();
-    let opaque = matches!(mode, crate::encryption_policy::Mode::Omemo2 | crate::encryption_policy::Mode::Pq);
+    let opaque = matches!(
+        mode,
+        crate::encryption_policy::Mode::Omemo2 | crate::encryption_policy::Mode::Pq
+    );
     job.check()?;
     let provider = discover(iq, owner).await?;
     job.check()?;
@@ -696,28 +755,38 @@ pub async fn run(
     if wire.size != wire_size {
         return Err("Upload size mismatch");
     }
-    let request = Element::builder("request", NS)
-        .attr("filename".try_into().unwrap(), &filename)
-        .attr("size".try_into().unwrap(), wire_size.to_string())
-        .attr("content-type".try_into().unwrap(), mime)
-        .build();
-    let root = iq
-        .request(&provider.jid, Kind::Get, request)
-        .await
-        .map_err(|_| "Upload slot request failed")?
-        .ok_or("Invalid upload slot")?;
-    let slot = slot(&root)?;
-    job.check()?;
-    let client = crate::downloads::client_builder()
+    let client = crate::downloads::https_client_builder()
         .build()
         .map_err(|_| "HTTPS unavailable")?;
-    put_wire(
+    let slot = put_with_slots(
         &client,
-        &slot,
         mime,
         &wire,
         job.clone(),
-        Duration::from_secs(3),
+        Duration::from_secs(30),
+        |attempt| {
+            let filename = if attempt == 0 {
+                filename.clone()
+            } else {
+                format!("{}-{}", uuid::Uuid::new_v4(), filename)
+            };
+            let request = Element::builder("request", NS)
+                .attr("filename".try_into().unwrap(), filename)
+                .attr("size".try_into().unwrap(), wire_size.to_string())
+                .attr("content-type".try_into().unwrap(), mime)
+                .build();
+            async {
+                let root = iq
+                    .request(&provider.jid, Kind::Get, request)
+                    .await
+                    .map_err(|error| {
+                        *job.diagnostic.lock().unwrap() = Some(format!("XMPP upload slot request: {error:?}"));
+                        "Upload slot request failed"
+                    })?
+                    .ok_or("Invalid upload slot")?;
+                slot(&root)
+            }
+        },
     )
     .await?;
     let wire_url = if encrypted {
@@ -735,7 +804,7 @@ pub async fn run(
         height: None,
         hashes: BTreeMap::from([("sha-256".into(), prepared.hash)]),
         manual: false,
-        sticker: draft.sticker,
+        sticker: draft.sticker, voice: draft.voice,
     };
     if !attachment.valid_outgoing(encrypted) {
         return Err("Invalid uploaded attachment");
@@ -850,10 +919,11 @@ mod tests {
                     workers.push(std::thread::spawn(move||{
                         let Ok(mut socket)=tls.accept(socket) else{return;};let mut header=Vec::new();let mut byte=[0];
                         while header.len()<16384 && !header.ends_with(b"\r\n\r\n"){if socket.read(&mut byte).ok()!=Some(1){return;}header.push(byte[0]);}
-                        let header=String::from_utf8(header).unwrap();let length=header.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length:").map(|v|v.trim().parse::<usize>().unwrap())).unwrap();if header.starts_with("PUT /slow-body "){std::thread::sleep(Duration::from_millis(250));}let mut body=vec![0;length];socket.read_exact(&mut body).unwrap();
+                        let header=String::from_utf8(header).unwrap();let length=header.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length:").map(|v|v.trim().parse::<usize>().unwrap())).unwrap();if header.starts_with("PUT /slow-body "){std::thread::sleep(Duration::from_millis(250));}let mut body=vec![0;length];if socket.read_exact(&mut body).is_err(){return;}
                         let attempt={let mut requests=seen.lock().unwrap();requests.push((header.clone(),body));requests.len()};
                         if header.starts_with("PUT /reject "){let _=write!(socket,"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");}
-                        else if header.starts_with("PUT /slow-body ") || header.starts_with("PUT /recover ") && attempt==2 {let _=write!(socket,"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");}
+                        else if header.starts_with("PUT /conflict-0 "){let _=write!(socket,"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");}
+                        else if header.starts_with("PUT /slow-body ") || header.starts_with("PUT /conflict-1 ") || header.starts_with("PUT /recover-") && attempt==2 {let _=write!(socket,"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");}
                         else {while !stopped.load(Ordering::Acquire){std::thread::sleep(Duration::from_millis(2));}}
                     }));
                 }
@@ -870,7 +940,7 @@ mod tests {
             }
         }
         fn client(&self) -> reqwest::Client {
-            crate::downloads::client_builder()
+            crate::downloads::https_client_builder()
                 .no_proxy()
                 .add_root_certificate(reqwest::Certificate::from_pem(&self.cert).unwrap())
                 .build()
@@ -942,20 +1012,21 @@ mod tests {
             .build()
             .unwrap();
         runtime
-            .block_on(put_wire(
+            .block_on(put_with_slots(
                 &server.client(),
-                &server.slot("/recover"),
                 "application/octet-stream",
                 &wire,
                 Arc::new(Job::default()),
                 Duration::from_millis(80),
+                |attempt| std::future::ready(Ok(server.slot(&format!("/recover-{attempt}")))),
             ))
             .unwrap();
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0].0, requests[1].0,
-            "same slot, length and allowed headers"
+        assert_ne!(
+            requests[0].0.lines().next(),
+            requests[1].0.lines().next(),
+            "Recovery needs a fresh upload slot"
         );
         assert!(
             requests[0]
@@ -971,6 +1042,46 @@ mod tests {
         );
         assert_eq!(requests[0].1, expected);
         assert_eq!(requests[1].1, expected);
+    }
+    #[test]
+    fn conflict_uses_fresh_slot_and_its_download_url() {
+        let directory = Directory::new();
+        let path = directory.0.join("plain");
+        let body = b"synthetic upload payload";
+        fs::write(&path, body).unwrap();
+        let prepared = Prepared {
+            path,
+            name: "fixture.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: body.len() as u64,
+            hash: openssl::sha::sha256(body).to_vec(),
+        };
+        let wire = prepare_wire(&prepared, None, Arc::new(Job::default())).unwrap();
+        let server = Https::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let accepted = runtime
+            .block_on(put_with_slots(
+                &server.client(),
+                "application/octet-stream",
+                &wire,
+                Arc::new(Job::default()),
+                Duration::from_secs(1),
+                |attempt| {
+                    let mut slot = server.slot(&format!("/conflict-{attempt}"));
+                    slot.get.set_path(&format!("/download-{attempt}"));
+                    std::future::ready(Ok(slot))
+                },
+            ))
+            .unwrap();
+        assert_eq!(accepted.get.path(), "/download-1");
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0].0.lines().next(), requests[1].0.lines().next());
+        assert_eq!(requests[0].1, body);
+        assert_eq!(requests[1].1, body);
     }
     #[test]
     fn failed_recovery_is_bounded_business_errors_and_cancellation_do_not_replay() {
@@ -997,19 +1108,27 @@ mod tests {
                 .read_timeout(Duration::from_millis(150))
                 .build()
                 .unwrap();
+            let diagnostic_job = Arc::new(Job::default());
             assert!(
                 runtime
-                    .block_on(put_wire(
+                    .block_on(put_with_slots(
                         &client,
-                        &server.slot(route),
                         "application/octet-stream",
                         &wire,
-                        Arc::new(Job::default()),
-                        Duration::from_millis(50)
+                        diagnostic_job.clone(),
+                        Duration::from_millis(50),
+                        |attempt| std::future::ready(Ok(server.slot(&if route == "/reject" {
+                            route.into()
+                        } else {
+                            format!("{route}-{attempt}")
+                        })))
                     ))
                     .is_err()
             );
             assert_eq!(server.requests.lock().unwrap().len(), count);
+            if route == "/reject" {
+                assert!(diagnostic_job.diagnostic.lock().unwrap().as_deref().unwrap().contains("HTTP PUT status=403"));
+            }
         }
         let server = Https::new();
         let job = Arc::new(Job::default());
@@ -1055,6 +1174,15 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        // The shared download timeout used to expire while a healthy upload
+        // was still producing its body, before the acknowledgement clock began.
+        {
+            let old=Https::new();
+            let client=crate::downloads::client_builder().no_proxy()
+                .add_root_certificate(reqwest::Certificate::from_pem(&old.cert).unwrap())
+                .read_timeout(Duration::from_millis(80)).build().unwrap();
+            assert_eq!(runtime.block_on(put_wire(&client,&old.slot("/slow-body"),"application/octet-stream",&wire,Arc::new(Job::default()),Duration::from_millis(80))),Err("Upload response interrupted"));
+        }
         let start = std::time::Instant::now();
         runtime
             .block_on(put_wire(
@@ -1128,6 +1256,8 @@ mod tests {
             name: "file.txt".into(),
             error: None,
             sticker: false,
+            voice: false,
+            local_sticker: None,
         };
         let target = directory.0.join("account/uploads/snapshot.input");
         let prepared = prepare(target.clone(), &draft, 100, &Job::default()).unwrap();

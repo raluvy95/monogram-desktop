@@ -146,7 +146,7 @@ impl ComposerInlineEmoji {
 mod composer_tests {
     use super::*;
 
-    #[test]
+    #[gtk::test]
     fn ordinary_typing_preserves_span_and_inside_edit_prunes_it() {
         gtk::init().unwrap();
         let buffer = gtk::TextBuffer::new(None);
@@ -512,6 +512,7 @@ impl InlineMessageText {
             picture.set_paintable(texture.as_ref());
             picture.set_visible(texture.is_some());
             root.add_overlay(&picture);
+            root.set_overlay_size(&picture,20,20);
             self.slots
                 .borrow_mut()
                 .entry(range.asset.cid.clone())
@@ -711,7 +712,6 @@ impl Ui {
         inserted
     }
 
-    pub(crate) fn inline_message_text(self:&Rc<Self>,body:&str,emoji:&InlineEmoji,status:Option<&gtk::Box>,links:&[crate::link_previews::ClickableUrl])->gtk::Widget{self.inline_message_text_formatted(body,emoji,status,links,None)}
     pub(crate) fn inline_message_text_formatted(
         self: &Rc<Self>,
         body: &str,
@@ -788,7 +788,7 @@ impl Ui {
    std::thread::sleep(Duration::from_millis(2));
   }
   let renderer=weak.upgrade().expect("Renderer must live with its returned row");assert_eq!(renderer.textures.borrow().len(),1,"Artwork must finish decoding through the production async path");
-  let slots=renderer.slots.borrow();assert_eq!(slots.values().map(Vec::len).sum::<usize>(),5);assert!(slots.values().flatten().all(|s|s.picture.upgrade().is_some_and(|p|p.paintable().is_some())));drop(slots);drop(renderer);
+  let slots=renderer.slots.borrow();assert_eq!(slots.values().map(Vec::len).sum::<usize>(),5);assert!(slots.values().flatten().all(|s|s.picture.upgrade().is_some_and(|p|p.paintable().is_some())));let deadline=Instant::now()+Duration::from_secs(1);while Instant::now()<deadline{context.iteration(false);if slots.values().flatten().all(|s|s.picture.upgrade().is_some_and(|p|p.width()==20&&p.height()==20)){break;}}assert!(slots.values().flatten().all(|s|s.picture.upgrade().is_some_and(|p|p.width()==20&&p.height()==20)),"Emoji artwork must stay inside its20px text slot");drop(slots);drop(renderer);
   window.set_child(gtk::Widget::NONE);window.close();drop(root);drop(window);let cleanup=Instant::now()+Duration::from_secs(1);while weak.upgrade().is_some()&&Instant::now()<cleanup{context.iteration(false);std::thread::sleep(Duration::from_millis(2));}assert!(weak.upgrade().is_none(),"Discarding a virtual row must release its renderer");ui.window.close();
   eprintln!("Production custom emoji: async artwork decoded, all five slots painted, renderer released with row");
  }

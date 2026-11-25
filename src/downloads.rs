@@ -35,15 +35,14 @@ pub enum Status {
     },
     Cancelled,
 }
-const AUTO_MAX: u64 = 10 * 1024 * 1024;
-const AUTO_SIZE: &str = "Media exceeds the automatic download limit or its size is unknown";
-const AUTO_TYPE: &str = "The server did not identify this as media";
+pub(crate) const DEFAULT_AUTO_MAX: u64 = 15 * 1024 * 1024;
+const AUTO_SIZE: &str = "File exceeds the automatic download limit or its size is unknown";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Policy {
     Cache,
     Manual,
-    Automatic,
+    Automatic(u64),
 }
 struct Task {
     policy: Policy,
@@ -95,6 +94,9 @@ impl Downloads {
             *task.state.lock().unwrap() = Status::Cancelled;
         }
     }
+    pub fn reset_automatic(&mut self) {
+        self.tasks.retain(|_,task| !matches!(task.policy,Policy::Automatic(_)));
+    }
     pub fn clear(&mut self) {
         self.tasks.clear();
     }
@@ -104,9 +106,9 @@ impl Downloads {
     pub fn restore_cached(&mut self, account: &str, file: Attachment) -> Result<(), &'static str> {
         self.start_with_policy(account, file, Policy::Cache)
     }
-    pub fn start_automatic(&mut self, account: &str, file: Attachment) {
-        if !file.manual && file.media_candidate() && self.status(account, &file).is_none() {
-            let _ = self.start_with_policy(account, file, Policy::Automatic);
+    pub fn start_automatic(&mut self, account: &str, file: Attachment, limit:u64) {
+        if limit>0 && (file.media_candidate() || file.audio_candidate() || file.player_audio_candidate()) && !file.manual && self.status(account, &file).is_none() {
+            let _ = self.start_with_policy(account, file, Policy::Automatic(limit.min(MAX)));
         }
     }
     fn start_with_policy(
@@ -180,7 +182,7 @@ impl Downloads {
             } else {
                 *current = match result {
                     Ok(path) => Status::Ready(path),
-                    Err(reason @ (AUTO_SIZE | AUTO_TYPE)) => Status::Deferred {
+                    Err(reason @ AUTO_SIZE) => Status::Deferred {
                         reason,
                         total: match *current {
                             Status::Running { total, .. } => total,
@@ -217,6 +219,9 @@ fn client() -> Result<reqwest::Client, &'static str> {
     client_builder().build().map_err(|_| "HTTPS unavailable")
 }
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    https_client_builder().read_timeout(Duration::from_secs(30))
+}
+pub(crate) fn https_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -226,7 +231,6 @@ pub(crate) fn client_builder() -> reqwest::ClientBuilder {
         .no_deflate()
         .no_zstd()
         .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(30))
 }
 fn transfer_error(error: &reqwest::Error, body: bool) -> &'static str {
     // Match mobile's safe exception categories; private URLs and keys stay out of logs.
@@ -423,36 +427,12 @@ async fn download(
         total,
         reconnecting: false,
     };
-    let limit = if policy == Policy::Automatic {
-        let mime = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
-            });
-        if !mime.as_deref().is_some_and(|mime| {
-            mime.starts_with("image/")
-                || mime.starts_with("video/")
-                || mime == "application/octet-stream"
-                    && (link.encrypted() || file.image_extension() || file.video_extension())
-        }) {
-            return Err(AUTO_TYPE);
-        }
-        if total.is_none_or(|total| total > AUTO_MAX)
-            || file.size.is_some_and(|size| size > AUTO_MAX)
-        {
+    let limit = if let Policy::Automatic(limit)=policy {
+        if total.is_none_or(|total|total>limit) || file.size.is_some_and(|size|size>limit) {
             return Err(AUTO_SIZE);
         }
-        AUTO_MAX
-    } else {
-        MAX
-    };
+        limit
+    }else{MAX};
     if let (Some(expected), Some(size)) = (expected, file.size)
         && expected - overhead != size
     {
@@ -690,6 +670,30 @@ mod tests {
             self.thread.take().unwrap().join().unwrap();
         }
     }
+    #[test]
+    fn ordinary_documents_never_start_automatically() {
+        let mut downloads=Downloads::default();
+        let mut file=Attachment::bare("https://fixture.invalid/document.zip").unwrap();
+        file.name="document.zip".into();file.mime="application/zip".into();file.manual=false;
+        downloads.start_automatic("owner@fixture.invalid",file.clone(),DEFAULT_AUTO_MAX);
+        assert!(downloads.status("owner@fixture.invalid",&file).is_none());
+        assert!(downloads.tasks.is_empty());
+    }
+    #[test]
+    fn automatic_media_obey_the_configured_limit() {
+        let server=Server::new(b"a small document".to_vec());let client=server.client();
+        let mut file=Attachment::bare(&format!("{}/file",server.url)).unwrap();file.name="photo.png".into();file.mime="image/png".into();file.manual=false;
+        let root=std::env::temp_dir().join(crate::model::new_id());
+        let state=Mutex::new(Status::Running{bytes:0,total:None,reconnecting:false});
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert_eq!(DEFAULT_AUTO_MAX,15*1024*1024);
+        let path=rt.block_on(download(&client,&file,&root,&AtomicBool::new(false),&state,Policy::Automatic(16))).unwrap();
+        assert_eq!(fs::read(&path).unwrap(),b"a small document");fs::remove_file(&path).unwrap();
+        assert_eq!(rt.block_on(download(&client,&file,&root,&AtomicBool::new(false),&state,Policy::Automatic(15))),Err(AUTO_SIZE));
+        assert!(!path.exists(),"over-limit documents are not committed");
+        let _=fs::remove_dir_all(root);
+    }
+
     #[test]
     fn stalled_headers_report_timeout_without_committing_a_file() {
         let server = Server::new(b"untrusted".to_vec());

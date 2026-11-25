@@ -6,7 +6,7 @@ use crate::{
     widgets::*,
 };
 use adw::prelude::*;
-use gtk::{gdk, glib, prelude::*};
+use gtk::{gdk, glib};
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 pub fn model(message: &Message) -> Markup {
@@ -134,6 +134,7 @@ impl FormattedLabel {
             }
         });
 
+        if !this.rich.links.is_empty(){let weak=Rc::downgrade(&this);watch_url_width(label,move |_|{if let Some(state)=weak.upgrade(){state.render();}});}
         this.render();
         this
     }
@@ -250,16 +251,18 @@ impl FormattedLabel {
         let Some(label) = self.label.upgrade() else {
             return;
         };
-        let attrs = label.attributes();
+        let attrs = text_attributes(&label);
         let revealed = self.revealed.borrow();
-        label.set_markup(&markup(&self.rich, &revealed, &self.suffix.borrow()));
+        label.set_markup(&markup_for_label(&self.rich, &revealed, &self.suffix.borrow(),Some(&label)));
         label.set_attributes(attrs.as_ref());
         label.update_property(&[gtk::accessible::Property::Label(
             &self.copy_text(0, self.rich.text.chars().count()),
         )]);
     }
 }
-fn markup(rich: &RichText, revealed: &BTreeSet<usize>, suffix: &str) -> String {
+#[cfg(test)]
+fn markup(rich: &RichText, revealed: &BTreeSet<usize>, suffix: &str) -> String {markup_for_label(rich,revealed,suffix,None)}
+fn markup_for_label(rich:&RichText,revealed:&BTreeSet<usize>,suffix:&str,label:Option<&gtk::Label>)->String {
     let offsets: Vec<_> = rich
         .text
         .char_indices()
@@ -304,7 +307,7 @@ fn markup(rich: &RichText, revealed: &BTreeSet<usize>, suffix: &str) -> String {
             out.push_str(&format!("<a href=\"monogram-spoiler:{index}\"><span foreground=\"#77777700\" background=\"#777777\" underline=\"none\">"));
         } else if let Some(link) = link {
             out.push_str(&format!(
-                "<a href=\"{}\"><span allow_breaks=\"false\">",
+                "<a href=\"{}\">",
                 glib::markup_escape_text(&link.uri)
             ));
         }
@@ -328,16 +331,15 @@ fn markup(rich: &RichText, revealed: &BTreeSet<usize>, suffix: &str) -> String {
             out.push_str(open);
             closes.push(close);
         }
-        out.push_str(&glib::markup_escape_text(
-            &rich.text[offsets[a]..offsets[b]],
-        ));
+        let value=&rich.text[offsets[a]..offsets[b]];
+        if hidden.is_none()&&link.is_some(){out.push_str(&url_text_markup(value,label));}else{out.push_str(&glib::markup_escape_text(value));}
         for close in closes.into_iter().rev() {
             out.push_str(close);
         }
         if hidden.is_some() {
             out.push_str("</span></a>");
         } else if link.is_some() {
-            out.push_str("</span></a>");
+            out.push_str("</a>");
         }
     }
     out.push_str(&glib::markup_escape_text(suffix));
@@ -455,6 +457,9 @@ fn block_widget(block: &Block) -> gtk::Widget {
                 .hscrollbar_policy(gtk::PolicyType::Automatic)
                 .vscrollbar_policy(gtk::PolicyType::Never)
                 .propagate_natural_height(true)
+                // Size the block to its code (up to the bubble limit), then scroll sideways;
+                // without this the bubble shrinks to the "Code" caption and hides the code.
+                .propagate_natural_width(true)
                 .min_content_height(0)
                 .build();
             let label = gtk::Label::new(Some(&source));
@@ -681,7 +686,7 @@ pub fn install_editor(
     }
     let all = whole.clone();
     let weak = Rc::downgrade(ui);
-    let weak_view = view.downgrade();
+    let _weak_view = view.downgrade();
     all.connect_activate(move |action, _| {
         let value = !action
             .state()
@@ -746,7 +751,7 @@ pub fn install_editor(
             gdk::Key::k | gdk::Key::K => "link",
             _ => return glib::Propagation::Proceed,
         };
-        if let Some(ui) = weak.upgrade() {
+        if let Some(_ui) = weak.upgrade() {
             if let Some(view) = weak_view.upgrade() {
                 if view.buffer().has_selection() {
                     let _ = view.activate_action(&format!("format.{action}"), None);

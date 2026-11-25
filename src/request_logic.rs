@@ -50,9 +50,6 @@ const CHANGED: &str = "This request changed. Close it and review the current req
 const DATABASE: &str = "Pending requests could not be saved. Please try again.";
 
 impl Ui {
-    pub fn pending_requests(&self) -> Result<PendingRequests, String> {
-        self.pending_requests_before(None)
-    }
     pub fn pending_requests_before(&self, before: Option<u64>) -> Result<PendingRequests, String> {
         let state = self.state.borrow();
         if state.account.is_empty() {
@@ -86,6 +83,7 @@ impl Ui {
             .unwrap_or(state.requests.len())
     }
     fn refresh_pending_requests(self: &Rc<Self>) {
+        self.requests_revision.set(self.requests_revision.get().wrapping_add(1));
         let owner = self.state.borrow().account.clone();
         if !owner.is_empty() {
             if let Ok(requests) = self.store.pending_requests(&owner) {
@@ -458,17 +456,25 @@ impl Ui {
             if ui.generation.get() != generation {
                 return Err(CHANGED.into());
             }
-            ui.current_invitation(&record)?;
             let room = result.map_err(|error| error.to_string())?;
+            let pending=ui.store.room_invitation(&record.owner,&record.room).map_err(|_|DATABASE.to_string())?;
+            if pending.as_ref().is_some_and(|current|current.revision!=record.revision){return Err(CHANGED.into());}
             if !ui.remember_room(&room) {
                 return Err("The group is joined, but its local settings could not be saved. The invitation has been kept.".into());
             }
-            let removed = ui.dismiss_room_invitation(&record)?;
+            let removed = pending.is_none() || ui.dismiss_room_invitation(&record)?;
             ui.open_room(&room);
             if !removed {
                 return Err(CHANGED.into());
             }
             Ok(())
+        }
+    }
+    pub(crate) fn resolve_room_invitations(self: &Rc<Self>, rooms:&[String]) {
+        let owner=self.state.borrow().account.clone();
+        if owner.is_empty(){return;}
+        for room in rooms {
+            if let Ok(Some(record))=self.store.room_invitation(&owner,room){let _=self.dismiss_room_invitation(&record);}
         }
     }
     pub fn dismiss_room_invitation(

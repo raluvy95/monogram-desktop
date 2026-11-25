@@ -27,6 +27,7 @@ fn lottie_visible(picture: &gtk::Picture, scroll: &glib::WeakRef<gtk::ScrolledWi
     scroll.upgrade().is_some_and(|scroll| {
         picture.compute_bounds(&scroll).is_some_and(|bounds| {
             bounds.y() + bounds.height() >= 0. && bounds.y() <= scroll.height() as f32
+                && bounds.x() + bounds.width() >= 0. && bounds.x() <= scroll.width() as f32
         })
     })
 }
@@ -35,7 +36,7 @@ fn wait_lottie_visible(
     picture: glib::WeakRef<gtk::Picture>,
     spinner: glib::WeakRef<gtk::Spinner>,
     scroll: glib::WeakRef<gtk::ScrolledWindow>,
-    source: Arc<crate::downloads::VerifiedFile>,
+    source: LottieSource,
     serial: Rc<Cell<u64>>,
     expected: u64,
 ) {
@@ -67,7 +68,7 @@ fn schedule_lottie_frame(
     picture: glib::WeakRef<gtk::Picture>,
     spinner: glib::WeakRef<gtk::Spinner>,
     scroll: glib::WeakRef<gtk::ScrolledWindow>,
-    source: Arc<crate::downloads::VerifiedFile>,
+    source: LottieSource,
     serial: Rc<Cell<u64>>,
     expected: u64,
     cancel: gio::Cancellable,
@@ -95,6 +96,13 @@ fn schedule_lottie_frame(
         let cancel_after = cancel.clone();
         glib::spawn_future_local(async move {
             let permit = lottie_permit().await;
+            // The tile may have scrolled away while this waited for a slot: do not spend one on a
+            // frame nobody will see, and close its decoder off the main thread.
+            if serial_after.get() != expected || cancel_after.is_cancelled() || picture_after.upgrade().is_none() {
+                drop(permit);
+                gio::spawn_blocking(move || drop(decoder));
+                return;
+            }
             let result = gio::spawn_blocking(move || {
                 let mut decoder = decoder;
                 let frame = decoder.frame();
@@ -131,7 +139,7 @@ fn start_lottie(
     picture: &gtk::Picture,
     spinner: &gtk::Spinner,
     scroll: &gtk::ScrolledWindow,
-    source: Arc<crate::downloads::VerifiedFile>,
+    source: LottieSource,
     serial: Rc<Cell<u64>>,
 ) {
     let expected = serial.get().wrapping_add(1);
@@ -143,17 +151,51 @@ fn start_lottie(
     let source_frames = source.clone();
     glib::spawn_future_local(async move {
         let permit = lottie_permit().await;
+        // This waited its turn behind every other tile. Jumping to the end of a long pack maps and
+        // unmaps hundreds of tiles on the way, and each of those is still in the queue: without
+        // this check every one of them would decode in turn before the tiles on screen now.
+        // A tile that has gone is skipped here, in microseconds, without opening anything.
+        if serial.get() != expected || cancel.is_cancelled() {
+            drop(permit);
+            return;
+        }
+        let Some(live) = picture_weak.upgrade() else {
+            drop(permit);
+            return;
+        };
+        // Mapped but not in view (a row just beyond the edge): wait until it is, rather than
+        // spending a decoder on it ahead of a tile you can see.
+        if !lottie_visible(&live, &scroll_weak) {
+            drop(permit);
+            wait_lottie_visible(picture_weak, spinner_weak, scroll_weak, source_frames, serial, expected);
+            return;
+        }
+        drop(live);
         let worker_cancel = cancel.clone();
         let result = gio::spawn_blocking(move || {
-            let input = source.reopen()?;
+            let input = source()?;
             let mut decoder = crate::lottie::Decoder::open(input, 192, &worker_cancel)?;
             let frame = decoder.frame()?;
             Ok::<_, &'static str>((decoder, frame))
         })
         .await;
         drop(permit);
-        let (Some(picture), Ok(Ok((decoder, frame)))) = (picture_weak.upgrade(), result) else {
+        let Some(picture) = picture_weak.upgrade() else {
             return;
+        };
+        let (decoder, frame) = match result {
+            Ok(Ok(started)) => started,
+            failure => {
+                if serial.get() == expected && !cancel.is_cancelled() {
+                    let reason = match failure {
+                        Ok(Err(reason)) => reason,
+                        _ => "The preview worker stopped",
+                    };
+                    eprintln!("Monogram preview failed: {reason}");
+                    show_preview_error(&picture, reason);
+                }
+                return;
+            }
         };
         if serial.get() != expected || cancel.is_cancelled() {
             return;
@@ -177,13 +219,26 @@ fn start_lottie(
     });
 }
 
+/// Replaces a tile's loading spinner with a stock GNOME icon when its artwork cannot be shown.
+fn show_preview_error(picture: &gtk::Picture, reason: &str) {
+    if let Some(button) = picture.ancestor(gtk::Button::static_type()).and_downcast::<gtk::Button>() {
+        button.set_icon_name("image-missing-symbolic");
+        button.set_tooltip_text(Some(reason));
+    }
+}
+
+type LottieSource=Arc<dyn Fn()->Result<crate::downloads::VerifiedFile,&'static str>+Send+Sync>;
+
 fn install_lottie(
     picture: &gtk::Picture,
     spinner: &gtk::Spinner,
     scroll: &gtk::ScrolledWindow,
     verified: crate::downloads::VerifiedFile,
 ) {
-    let source = Arc::new(verified);
+    install_lottie_reopenable(picture,spinner,scroll,move||verified.reopen());
+}
+fn install_lottie_reopenable(picture:&gtk::Picture,spinner:&gtk::Spinner,scroll:&gtk::ScrolledWindow,open:impl Fn()->Result<crate::downloads::VerifiedFile,&'static str>+Send+Sync+'static) {
+    let source:LottieSource=Arc::new(open);
     let serial = Rc::new(Cell::new(0));
     let picture_weak = picture.downgrade();
     let spinner_weak = spinner.downgrade();
@@ -891,6 +946,7 @@ pub(crate) enum PackLibraryAction {
     ImportTelegram,
     Create,
     Manage,
+    Edit,
 }
 
 #[derive(Clone, Debug)]
@@ -901,11 +957,12 @@ pub(crate) enum PackSelection {
 
 #[derive(Clone)]
 enum PickerRow {
-    Heading(String),
+    Heading(i64, String),
     Empty(String),
     Emoji(Vec<crate::emoji_completion::EmojiEntry>),
     Pack(Vec<crate::packs::Item>),
     Favorites(Vec<FavoriteEntry>),
+    Recent(Vec<FavoriteEntry>),
 }
 
 #[derive(Clone)]
@@ -927,6 +984,7 @@ struct PackPreviewCell {
     picture: gtk::Picture,
     spinner: gtk::Spinner,
     item_id: i64,
+    skip_activation: Rc<Cell<bool>>,
 }
 
 fn pack_selector_button(icon: &str, title: &str) -> gtk::ToggleButton {
@@ -968,6 +1026,9 @@ pub(crate) struct PackLibraryPage {
     preview_active: Cell<usize>,
     preview_epoch: Cell<u64>,
     preview_queue: RefCell<Vec<PackPreviewCell>>,
+    hovered_video: Cell<Option<i64>>,
+    pending_items: RefCell<std::collections::HashSet<i64>>,
+    video_preview: RefCell<Option<(glib::WeakRef<gtk::Picture>, gtk::gdk::Texture, Rc<crate::video_ui::Playback>)>>,
     selected: RefCell<Option<i64>>,
     sections: RefCell<Vec<(i64, String, Vec<crate::packs::Item>)>>,
     job: RefCell<Option<Job>>,
@@ -998,11 +1059,15 @@ impl PackLibraryPage {
         } else {
             let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
             bar.add_css_class("pack-selector");
+            bar.set_vexpand(false);
+            bar.set_valign(gtk::Align::Start);
             let selector = gtk::Box::new(gtk::Orientation::Horizontal, 2);
             selector.add_css_class("emoji-category-bar");
             let settings = gtk::Box::new(gtk::Orientation::Horizontal, 2);
             let selector_scroll = crate::widgets::horizontal_strip(&selector);
             selector_scroll.set_hexpand(true);
+            selector_scroll.set_vexpand(false);
+            selector_scroll.set_valign(gtk::Align::Start);
             bar.append(&selector_scroll);
             bar.append(&settings);
             root.append(&bar);
@@ -1028,12 +1093,8 @@ impl PackLibraryPage {
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         menu.add_css_class("message-menu-panel");
         for button in [&import, &telegram, &create, &manage] {
-            button.add_css_class("flat");
-            button.add_css_class("context-menu-row");
+            crate::widgets::style_context_button(button);
             button.add_css_class("picker-menu-row");
-            if let Some(label) = button.child().and_downcast::<gtk::Label>() {
-                label.set_xalign(0.);
-            }
             menu.append(button);
         }
         let popover = gtk::Popover::builder()
@@ -1122,6 +1183,9 @@ impl PackLibraryPage {
             preview_active: Cell::new(0),
             preview_epoch: Cell::new(0),
             preview_queue: RefCell::new(Vec::new()),
+            hovered_video: Cell::new(None),
+            pending_items: RefCell::new(Default::default()),
+            video_preview: RefCell::new(None),
             selected: RefCell::new(None),
             sections: RefCell::new(Default::default()),
             job: RefCell::new(None),
@@ -1173,6 +1237,7 @@ impl PackLibraryPage {
             let weak = Rc::downgrade(&page);
             scroll.vadjustment().connect_value_changed(move |_| {
                 if let Some(page) = weak.upgrade() {
+                    page.stop_video_preview();
                     page.pump_pack_previews();
                 }
             });
@@ -1292,6 +1357,7 @@ impl PackLibraryPage {
     }
 
     fn show_snapshot(self: &Rc<Self>, snapshot: Snapshot) {
+        self.pending_items.replace(snapshot.packs.iter().filter(|p|p.sync_pending).flat_map(|p|p.items.iter().map(|i|i.id)).collect());
         self.section_buttons.borrow_mut().clear();
         while let Some(child) = self.selector.first_child() {
             self.selector.remove(&child);
@@ -1350,7 +1416,7 @@ impl PackLibraryPage {
         self.selected.replace(Some(selected));
         let mut group = self.group_anchor.clone();
         if !self.external_selector {
-            for (id, title, items) in &sections {
+            for (id, title, _items) in &sections {
                 let icon = if *id == -1 {
                     "emoji_tabs_faves.webp"
                 } else {
@@ -1393,11 +1459,15 @@ impl PackLibraryPage {
                 group = Some(button.clone());
             }
             button.set_active(pack.id == selected);
+            self.attach_pack_drag(&button, pack.id);
             let weak = Rc::downgrade(self);
             let preview = button.downgrade();
             let library = self.library.clone();
-            if let Some(item) = pack.items.first() {
+            if pack.sync_pending {
+                let downloading=gtk::Spinner::new();downloading.start();downloading.set_size_request(22,22);button.set_child(Some(&downloading));button.set_tooltip_text(Some(&format!("{} · Downloading…",pack.name)));
+            } else if let Some(item) = pack.items.first() {
                 let item = item.id;
+                let icon_page=weak.clone();
                 glib::spawn_future_local(async move {
                     let Ok((asset, verified)) = library.verified_asset(item, Job::new()).await
                     else {
@@ -1406,24 +1476,62 @@ impl PackLibraryPage {
                     let Some(button) = preview.upgrade() else {
                         return;
                     };
+                    let picture = gtk::Picture::new();
+                    picture.set_size_request(24, 24);
+                    picture.set_can_shrink(true);
+                    picture.set_content_fit(gtk::ContentFit::Contain);
+                    // Source media dimensions must not size the pack category strip.
+                    let icon_size = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                    icon_size.set_size_request(24, 24);
+                    let overlay = gtk::Overlay::builder().child(&icon_size).build();
+                    overlay.add_overlay(&picture);
+                    let spinner = gtk::Spinner::new();
+                    spinner.start();
+                    overlay.add_overlay(&spinner);
+                    button.set_child(Some(&overlay));
+                    let Some(page) = icon_page.upgrade() else { return; };
+                    let viewport = page.selector.ancestor(gtk::ScrolledWindow::static_type())
+                        .and_downcast::<gtk::ScrolledWindow>()
+                        .unwrap_or_else(|| page.scroll.clone());
                     let mime = asset.item.mime.clone();
-                    let texture = gio::spawn_blocking(move || {
-                        let cancel = gio::Cancellable::new();
-                        if mime == "application/x-tgsticker" {
-                            return crate::lottie::Decoder::open(verified.reopen()?, 32, &cancel)?
-                                .frame()
-                                .map(|frame| frame.texture);
+                    let library = page.library.clone();
+                    if mime == "application/x-tgsticker" {
+                        drop(verified);
+                        install_lottie_reopenable(&picture, &spinner, &viewport,
+                            move || library.reopen_preview(&asset));
+                    } else if mime.starts_with("image/") {
+                        drop(verified);
+                        let visible = viewport.downgrade();
+                        let busy = spinner.downgrade();
+                        crate::image_loader::play_input(&picture, 32,
+                            move |p| lottie_visible(p, &visible),
+                            move |p, texture| {
+                                p.set_paintable(Some(&texture));
+                                if let Some(s) = busy.upgrade() { s.stop(); s.set_visible(false); }
+                            }, true, move || library.reopen_preview(&asset));
+                    } else if mime == "video/webm"
+                        && gio::spawn_blocking(crate::video_ui::initialize).await.unwrap_or(false)
+                    {
+                        if let Some(player) = crate::video_ui::Playback::new(verified) {
+                            picture.set_paintable(Some(&player.media));
+                            spinner.stop();
+                            spinner.set_visible(false);
+                            let visible = viewport.downgrade();
+                            let playing = Rc::new(Cell::new(false));
+                            let state = playing.clone();
+                            let keep = player.clone();
+                            picture.connect_unmap(move |_| {
+                                keep.media.pause();
+                                state.set(false);
+                            });
+                            picture.add_tick_callback(move |p, _| {
+                                let active = lottie_visible(p, &visible);
+                                if playing.replace(active) != active {
+                                    if active { player.media.play(); } else { player.media.pause(); }
+                                }
+                                glib::ControlFlow::Continue
+                            });
                         }
-                        crate::image_loader::Decoder::open_sticker(verified, &cancel)?
-                            .frame(32)
-                            .map(|frame| frame.texture)
-                    })
-                    .await;
-                    if let Ok(Ok(texture)) = texture {
-                        let picture = gtk::Image::from_paintable(Some(&texture));
-                        picture.set_pixel_size(24);
-                        picture.set_size_request(24, 24);
-                        button.set_child(Some(&picture));
                     }
                 });
             }
@@ -1466,6 +1574,7 @@ impl PackLibraryPage {
     }
 
     pub(crate) fn rebuild_rows(self: &Rc<Self>) {
+        self.stop_video_preview();
         self.preview_epoch
             .set(self.preview_epoch.get().wrapping_add(1));
         self.preview_queue.borrow_mut().clear();
@@ -1510,6 +1619,7 @@ impl PackLibraryPage {
                 continue;
             }
             self.push_heading(&mut rows, id, &title);
+            if query.is_empty() && matches!(id,-1|-2) && self.section_collapsed(id) { continue; }
             if id == -1 {
                 let owner = self.library.account();
                 let mut entries: Vec<_> = builtin
@@ -1536,6 +1646,12 @@ impl PackLibraryPage {
                     Self::push_row(&mut rows, PickerRow::Empty("No favorites yet".into()));
                 }
                 continue;
+            }
+            if id == -2 && self.kind==Kind::Emoji {
+                let owner=self.library.account();let mut entries=builtin.into_iter().map(FavoriteEntry::Emoji).chain(items.into_iter().map(FavoriteEntry::Pack)).collect::<Vec<_>>();
+                let saved=ui.as_ref().map(|ui|ui.store.pref("picker:recent:emoji","[]")).unwrap_or_else(||"[]".into());let order:Vec<String>=serde_json::from_str(&saved).unwrap_or_default();entries.sort_by_key(|entry|order.iter().position(|key|key==&entry.key(owner)).unwrap_or(usize::MAX));
+                for row in entries.chunks(8){Self::push_row(&mut rows,PickerRow::Recent(row.to_vec()));}
+                if entries.is_empty(){Self::push_row(&mut rows,PickerRow::Empty("No recent yet".into()));}continue;
             }
             for row in builtin.chunks(8) {
                 Self::push_row(&mut rows, PickerRow::Emoji(row.to_vec()));
@@ -1577,9 +1693,59 @@ impl PackLibraryPage {
         self.model.splice(0, self.model.n_items(), &rows);
     }
 
+    fn attach_pack_drag(self: &Rc<Self>, button: &gtk::ToggleButton, id: i64) {
+        let source = gtk::DragSource::builder().actions(gtk::gdk::DragAction::MOVE).build();
+        source.connect_prepare(move |_, _, _| {Some(gtk::gdk::ContentProvider::for_value(&id.to_string().to_value()))});
+        source.connect_drag_begin(|source,_|source.set_icon(Some(&gtk::WidgetPaintable::new(gtk::Widget::NONE)),0,0));
+        button.add_controller(source);
+        let target = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+        target.set_preload(true);
+        target.connect_enter(|_, _, _| gtk::gdk::DragAction::MOVE);
+        let hovered = Rc::new(Cell::new(None));
+        let hover = hovered.clone();
+        let weak = Rc::downgrade(self);
+        target.connect_motion(move |target, _, _| {
+            let Some(page) = weak.upgrade() else { return gtk::gdk::DragAction::empty(); };
+            if let Some(from) = target.value().and_then(|v| v.get::<String>().ok()).and_then(|v|v.parse::<i64>().ok()) {
+                if hover.replace(Some(from)) != Some(from) { page.move_pack_tab(from, id); }
+            }
+            gtk::gdk::DragAction::MOVE
+        });
+        let weak = Rc::downgrade(self);
+        target.connect_drop(move |_, value, _, _| {
+            let (Some(page), Some(from)) = (weak.upgrade(), value.get::<String>().ok().and_then(|v|v.parse::<i64>().ok())) else { return false; };
+            if hovered.get() != Some(from) {page.move_pack_tab(from, id);}
+            page.save_pack_bar_order();
+            true
+        });
+        button.add_controller(target);
+        button.update_property(&[gtk::accessible::Property::Description("Drag or use Alt+Left and Alt+Right to reorder packs")]);
+        let keys=gtk::EventControllerKey::new();let weak=Rc::downgrade(self);let source=button.downgrade();keys.connect_key_pressed(move|_,key,_,modifiers|{
+            if !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK)||!matches!(key,gtk::gdk::Key::Left|gtk::gdk::Key::Right){return glib::Propagation::Proceed;}
+            let(Some(page),Some(source))=(weak.upgrade(),source.upgrade())else{return glib::Propagation::Proceed;};let mut ordered=Vec::new();let buttons=page.section_buttons.borrow();let mut child=page.selector.first_child();while let Some(widget)=child{child=widget.next_sibling();if buttons.iter().any(|(id,b)|*id>=0&&b.upcast_ref::<gtk::Widget>()==&widget){ordered.push(widget);}}drop(buttons);
+            let Some(from)=ordered.iter().position(|w|w==source.upcast_ref::<gtk::Widget>())else{return glib::Propagation::Proceed;};let to=if key==gtk::gdk::Key::Left{from.checked_sub(1)}else{from.checked_add(1).filter(|to|*to<ordered.len())};if let Some(to)=to{if from<to{page.selector.reorder_child_after(&source,Some(&ordered[to]));}else{page.selector.reorder_child_after(&source,ordered[to].prev_sibling().as_ref());}page.save_pack_bar_order();}glib::Propagation::Stop
+        });button.add_controller(keys);
+    }
+    fn move_pack_tab(&self, from: i64, to: i64) {
+        if from == to { return; }
+        let buttons = self.section_buttons.borrow();
+        let (Some(source), Some(target)) = (buttons.get(&from), buttons.get(&to)) else { return; };
+        let mut order = Vec::new(); let mut child = self.selector.first_child();
+        while let Some(widget) = child { child = widget.next_sibling(); order.push(widget); }
+        let (Some(from), Some(to)) = (order.iter().position(|w| w == source.upcast_ref::<gtk::Widget>()), order.iter().position(|w| w == target.upcast_ref::<gtk::Widget>())) else { return; };
+        if from < to { self.selector.reorder_child_after(source, Some(target)); }
+        else { self.selector.reorder_child_after(source, target.prev_sibling().as_ref()); }
+    }
+    fn save_pack_bar_order(self:&Rc<Self>){
+        let page=self.clone();
+let mut ids=Vec::new();let buttons=page.section_buttons.borrow();let mut child=page.selector.first_child();while let Some(widget)=child{child=widget.next_sibling();if let Some((id,_))=buttons.iter().find(|(id,b)|**id>=0&&b.upcast_ref::<gtk::Widget>()==&widget){ids.push(*id);}}drop(buttons);
+            page.status.set_label("Saving pack order…");page.status.set_visible(true);let library=page.library.clone();let kind=page.kind;glib::spawn_future_local(async move{match library.mutate(crate::packs::Mutation::Reorder{kind,ids}).await{Ok(_)=>page.refresh(),Err(error)=>page.status.set_label(&error.to_string())}});
+    }
+    fn collapsed_key(&self,id:i64)->String {format!("picker:collapsed:{}:{id}",if self.kind==Kind::Emoji{"emoji"}else{"stickers"})}
+    fn section_collapsed(&self,id:i64)->bool {self.ui.upgrade().is_some_and(|ui|ui.store.pref(&self.collapsed_key(id),"false")=="true")}
     fn push_heading(&self, rows: &mut Vec<glib::BoxedAnyObject>, id: i64, title: &str) {
         self.anchors.borrow_mut().insert(id, rows.len() as u32);
-        Self::push_row(rows, PickerRow::Heading(title.into()));
+        Self::push_row(rows, PickerRow::Heading(id,title.into()));
     }
     fn push_row(rows: &mut Vec<glib::BoxedAnyObject>, row: PickerRow) {
         rows.push(glib::BoxedAnyObject::new(row));
@@ -1587,7 +1753,8 @@ impl PackLibraryPage {
 
     fn row_widget(self: &Rc<Self>, row: &PickerRow) -> gtk::Widget {
         match row {
-            PickerRow::Favorites(entries) => {
+            PickerRow::Favorites(entries) | PickerRow::Recent(entries) => {
+                let row_kind=row;
                 let row = gtk::Box::new(
                     gtk::Orientation::Horizontal,
                     if self.kind == Kind::Emoji { 2 } else { 6 },
@@ -1607,6 +1774,8 @@ impl PackLibraryPage {
                             }
                             FavoriteEntry::Pack(item) => self.pack_cell(item).upcast(),
                         };
+                        let preview_cell = crate::widgets::SquareCell::new(&cell);
+                        if matches!(row_kind,PickerRow::Favorites(_)) {
                         let weak = Rc::downgrade(self);
                         favorite_order::attach(
                             &ui,
@@ -1624,9 +1793,9 @@ impl PackLibraryPage {
                                     .unwrap_or_default()
                             },
                         );
-                        let preview_cell = crate::widgets::SquareCell::new(&cell);
                         self.favorite_preview
                             .register(entry.key(self.library.account()), &preview_cell);
+                        }
                         row.append(&preview_cell);
                     }
                 }
@@ -1635,10 +1804,27 @@ impl PackLibraryPage {
                 }
                 row.upcast()
             }
-            PickerRow::Heading(title) | PickerRow::Empty(title) => {
+            PickerRow::Heading(id,title) if matches!(id,-1|-2) => {
+                let button=gtk::Button::new();button.add_css_class("flat");button.add_css_class("picker-section-toggle");
+                let body=gtk::Box::new(gtk::Orientation::Horizontal,6);let label=crate::widgets::text(title,"picker-section-heading");label.set_hexpand(true);body.append(&label);
+                let collapsed=self.section_collapsed(*id);body.append(&gtk::Image::from_icon_name(if collapsed{"pan-end-symbolic"}else{"pan-down-symbolic"}));button.set_child(Some(&body));
+                button.update_state(&[gtk::accessible::State::Expanded(Some(!collapsed))]);
+                let weak=Rc::downgrade(self);let id=*id;button.connect_clicked(move|_|{if let Some(page)=weak.upgrade(){if let Some(ui)=page.ui.upgrade(){let _=ui.store.set_pref(&page.collapsed_key(id),if page.section_collapsed(id){"false"}else{"true"});page.rebuild_rows();}}});button.upcast()
+            }
+            PickerRow::Heading(id, title) if *id >= 0 => {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                let label = crate::widgets::text(title, "picker-section-heading");
+                label.set_hexpand(true); label.set_xalign(0.);
+                let edit = crate::widgets::icon_button("document-edit-symbolic", "Edit Pack");
+                edit.add_css_class("flat");
+                let weak=Rc::downgrade(self); let id=*id;
+                edit.connect_clicked(move |_| { if let Some(page)=weak.upgrade() { (page.on_manage)(&page, PackLibraryAction::Edit, Some(id)); } });
+                row.append(&label);row.append(&edit);row.upcast()
+            }
+            PickerRow::Heading(_,title) | PickerRow::Empty(title) => {
                 let label = crate::widgets::text(
                     title,
-                    if matches!(row, PickerRow::Heading(_)) {
+                    if matches!(row, PickerRow::Heading(..)) {
                         "picker-section-heading"
                     } else {
                         "dim-label"
@@ -1715,38 +1901,31 @@ impl PackLibraryPage {
             .child(&overlay)
             .build();
         button.set_child(Some(&frame));
-        let favorite = gtk::GestureClick::new();
-        favorite.set_button(3);
-        let weak_favorite = Rc::downgrade(self);
-        let favorite_library = self.library.clone();
-        let favorite_id = item.id;
-        favorite.connect_released(move |_, _, _, _| {
-            let Some(page) = weak_favorite.upgrade() else {
-                return;
-            };
-            let enabled = !page.favorites.borrow().contains(&favorite_id);
-            let library = favorite_library.clone();
-            let weak = Rc::downgrade(&page);
-            glib::spawn_future_local(async move {
-                if library
-                    .mutate(crate::packs::Mutation::Favorite {
-                        item: favorite_id,
-                        value: enabled,
-                    })
-                    .await
-                    .is_ok()
-                    && let Some(page) = weak.upgrade()
-                {
-                    page.refresh();
-                }
-            });
-        });
-        button.add_controller(favorite);
+        if self.pending_items.borrow().contains(&item.id){
+            button.set_tooltip_text(Some(&format!("{} · Downloading…",item.name)));button.set_sensitive(false);return button;
+        }
+        let skip_activation=Rc::new(Cell::new(false));
+        if let Some(ui)=self.ui.upgrade(){crate::picker_zoom::attach(&ui,&button,skip_activation.clone());}
+        let alternate=gtk::GestureClick::new();alternate.set_button(1);alternate.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak=Rc::downgrade(self);let id=item.id;let skip=skip_activation.clone();
+        alternate.connect_pressed(move|gesture,_,_,_|{let alt=gesture.current_event_state().contains(gtk::gdk::ModifierType::ALT_MASK);skip.set(alt);if alt{gesture.set_state(gtk::EventSequenceState::Claimed);if let Some(page)=weak.upgrade(){page.toggle_item_favorite(id);}}});button.add_controller(alternate);
+        let secondary=gtk::GestureClick::new();secondary.set_button(3);let weak=Rc::downgrade(self);let target=button.downgrade();let skip=skip_activation.clone();
+        secondary.connect_pressed(move|gesture,_,x,y|{
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let(Some(page),Some(button))=(weak.upgrade(),target.upgrade())else{return;};
+            let menu=gtk::Popover::builder().has_arrow(false).autohide(true).build();menu.add_css_class("message-menu");menu.set_parent(&button);menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32,y as i32,1,1)));
+            let body=gtk::Box::new(gtk::Orientation::Vertical,0);body.add_css_class("message-menu-panel");
+            let favorite=gtk::Button::with_label(if page.favorites.borrow().contains(&id){"Remove from Favorites"}else{"Add to Favorites"});crate::widgets::style_context_button(&favorite);
+            let weak=Rc::downgrade(&page);let pop=menu.downgrade();favorite.connect_clicked(move|_|{if let Some(pop)=pop.upgrade(){pop.popdown();}if let Some(page)=weak.upgrade(){page.toggle_item_favorite(id);}});body.append(&favorite);
+            let send=gtk::Button::with_label(if page.kind==Kind::Emoji{"Insert Emoji"}else{"Send Sticker"});crate::widgets::style_context_button(&send);let target=button.downgrade();let pop=menu.downgrade();let skip=skip.clone();send.connect_clicked(move|_|{if let Some(pop)=pop.upgrade(){pop.popdown();}skip.set(false);if let Some(button)=target.upgrade(){button.emit_clicked();}});body.append(&send);
+            menu.set_child(Some(&body));menu.connect_closed(|pop|{if pop.parent().is_some(){pop.unparent();}});menu.popup();
+        });button.add_controller(secondary);
         self.preview_queue.borrow_mut().push(PackPreviewCell {
             button: button.downgrade(),
             picture,
             spinner,
             item_id: item.id,
+            skip_activation,
         });
         let weak = Rc::downgrade(self);
         button.connect_map(move |_| {
@@ -1760,6 +1939,37 @@ impl PackLibraryPage {
         button
     }
 
+    fn toggle_item_favorite(self:&Rc<Self>,id:i64) {
+        let enabled=!self.favorites.borrow().contains(&id);let library=self.library.clone();let weak=Rc::downgrade(self);
+        glib::spawn_future_local(async move{if library.mutate(crate::packs::Mutation::Favorite{item:id,value:enabled}).await.is_ok(){if let Some(page)=weak.upgrade(){page.refresh();}}});
+    }
+    fn stop_video_preview(&self) {
+        self.hovered_video.set(None);
+        if let Some((image,poster,player))=self.video_preview.borrow_mut().take(){
+            if let Some(image)=image.upgrade(){image.set_paintable(Some(&poster));}
+            player.media.pause();
+        }
+    }
+    fn start_video_preview(self:&Rc<Self>,id:i64,picture:&gtk::Picture,poster:&gtk::gdk::Texture) {
+        self.stop_video_preview();self.hovered_video.set(Some(id));
+        let weak=Rc::downgrade(self);let image=picture.downgrade();let poster=poster.clone();let library=self.library.clone();let epoch=self.preview_epoch.get();
+        glib::spawn_future_local(async move{
+            let result=library.verified_asset(id,Job::new()).await;
+            if !gio::spawn_blocking(crate::video_ui::initialize).await.unwrap_or(false){return;}
+            let (Some(page),Some(image),Ok((_,verified)))=(weak.upgrade(),image.upgrade(),result)else{return;};
+            if page.hovered_video.get()!=Some(id)||page.preview_epoch.get()!=epoch||!image.is_mapped(){return;}
+            if let Some(player)=crate::video_ui::Playback::new(verified){
+                // Keep the poster on screen until the stream has a decoded frame; swapping
+                // paintables immediately shows an empty picture while the video loads.
+                let swapped=Rc::new(Cell::new(false));let target=image.downgrade();
+                player.media.connect_invalidate_contents(move|media|{
+                    if swapped.get()||media.intrinsic_width()<=0{return;}
+                    if let Some(image)=target.upgrade(){swapped.set(true);image.set_paintable(Some(media));}
+                });
+                player.media.play();page.video_preview.replace(Some((image.downgrade(),poster,player)));
+            }
+        });
+    }
     fn pump_pack_previews(self: &Rc<Self>) {
         self.preview_queue
             .borrow_mut()
@@ -1781,8 +1991,35 @@ impl PackLibraryPage {
             self.preview_active.set(self.preview_active.get() + 1);
             let weak = Rc::downgrade(self);
             let library = self.library.clone();
+            let account = library.account().to_string();
             glib::spawn_future_local(async move {
-                let result = library.verified_asset(cell.item_id, Job::new()).await;
+                let result = match library.verified_asset(cell.item_id, Job::new()).await {
+                    Ok((asset,verified)) if asset.item.mime=="video/webm" => gio::spawn_blocking(move||{
+                        use std::os::fd::AsRawFd;
+                        // Extracting a poster decodes video, so keep it in the preview cache.
+                        let root=crate::preview_cache::account_root(&account);
+                        let key=crate::preview_cache::key("poster",1500,&asset.item.file);
+                        let modified=std::fs::metadata(&asset.path).and_then(|m|m.modified()).ok();
+                        if let Some(bytes)=root.as_deref().and_then(|root|crate::preview_cache::load(root,&key,modified)) {
+                            return Ok((asset,verified,Some(crate::image_loader::EncodedPreview{bytes,width:0,height:0})));
+                        }
+                        let path=std::path::PathBuf::from(format!("/proc/self/fd/{}",verified.0.as_raw_fd()));
+                        let poster=crate::image_loader::encode_webm_preview(&path,&gio::Cancellable::new(),1500)
+                            .map_err(crate::packs::Error)?;
+                        if let Some(root)=&root {crate::preview_cache::store(root,&key,&poster.bytes);}
+                        Ok((asset,verified,Some(poster)))
+                    }).await.unwrap_or(Err(crate::packs::Error("Video preview failed"))),
+                    Ok((asset,verified)) if asset.item.mime.starts_with("image/") => gio::spawn_blocking(move||{
+                        let root=crate::preview_cache::account_root(&account);
+                        let key=crate::preview_cache::key("still",192,&asset.item.file);
+                        let modified=std::fs::metadata(&asset.path).and_then(|m|m.modified()).ok();
+                        let cached=root.as_deref().and_then(|root|crate::preview_cache::load(root,&key,modified))
+                            .map(|bytes|crate::image_loader::EncodedPreview{bytes,width:0,height:0});
+                        Ok((asset,verified,cached))
+                    }).await.unwrap_or(Err(crate::packs::Error("Image preview failed"))),
+                    Ok((asset,verified))=>Ok((asset,verified,None)),
+                    Err(error)=>Err(error),
+                };
                 let Some(page) = weak.upgrade() else {
                     return;
                 };
@@ -1791,7 +2028,7 @@ impl PackLibraryPage {
                 if page.preview_epoch.get() == epoch
                     && let Some(button) = cell.button.upgrade()
                 {
-                    page.finish_pack_preview(button, cell.picture, cell.spinner, result);
+                    page.finish_pack_preview(button, cell.picture, cell.spinner, cell.skip_activation, result);
                 }
                 page.pump_pack_previews();
             });
@@ -1803,9 +2040,10 @@ impl PackLibraryPage {
         button: gtk::Button,
         picture: gtk::Picture,
         spinner: gtk::Spinner,
-        result: crate::packs::Result<(Asset, crate::downloads::VerifiedFile)>,
+        skip_activation: Rc<Cell<bool>>,
+        result: crate::packs::Result<(Asset, crate::downloads::VerifiedFile, Option<crate::image_loader::EncodedPreview>)>,
     ) {
-        let (asset, verified) = match result {
+        let (asset, verified, poster) = match result {
             Ok(asset) => asset,
             Err(error) => {
                 spinner.stop();
@@ -1818,14 +2056,14 @@ impl PackLibraryPage {
         let weak = Rc::downgrade(self);
         let recent_library = self.library.clone();
         let selection_asset = asset.clone();
-        button.connect_clicked(move |_| {
+        button.connect_clicked(move |button| {
+            if skip_activation.replace(false){return;}
             if let Some(page) = weak.upgrade() {
-                let library = recent_library.clone();
+                let library = recent_library.clone();let owner=library.account().to_string();let weak_ui=page.ui.clone();let kind=page.kind;
                 let item = selection_asset.item.id;
                 glib::spawn_future_local(async move {
-                    let _ = library
-                        .mutate(crate::packs::Mutation::Recent { item })
-                        .await;
+                    let _ = library.mutate(crate::packs::Mutation::Recent { item }).await;
+                    if kind==Kind::Emoji {if let Some(ui)=weak_ui.upgrade(){let key=favorite_order::pack_key(&owner,item);let _=ui.store.write_snapshot(move|store|store.record_picker_recent(&key)).await;}}
                 });
                 let selection = match page.kind {
                     Kind::Stickers => PackSelection::Sticker(selection_asset.clone()),
@@ -1834,46 +2072,64 @@ impl PackLibraryPage {
                         fallback: selection_asset.item.emoji.clone(),
                     },
                 };
+                if page.kind==Kind::Stickers {if let Some(ui)=page.ui.upgrade(){ui.send_animation.remember_sticker_source(button);}}
                 (page.on_select)(selection);
             }
         });
         if asset.item.mime == "video/webm" {
-            if let Some(player) = crate::video_ui::Playback::new(verified) {
-                picture.set_paintable(Some(&player.media));
+            drop(verified);
+            if let Some(poster)=poster.and_then(|p|gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(p.bytes)).ok()) {
+                picture.set_paintable(Some(&poster));spinner.stop();spinner.set_visible(false);
+                let motion=gtk::EventControllerMotion::new();let weak=Rc::downgrade(self);let image=picture.downgrade();let id=asset.item.id;
+                motion.connect_enter(move|_,_,_|{if let(Some(page),Some(image))=(weak.upgrade(),image.upgrade()){page.start_video_preview(id,&image,&poster);}});
+                let weak=Rc::downgrade(self);motion.connect_leave(move |_|{if let Some(page)=weak.upgrade(){if page.hovered_video.get()==Some(id){page.stop_video_preview();}}});button.add_controller(motion);
+                let weak=Rc::downgrade(self);picture.connect_unmap(move |_|{if let Some(page)=weak.upgrade(){if page.hovered_video.get()==Some(id){page.stop_video_preview();}}});
+            } else {spinner.stop();spinner.set_visible(false);button.set_icon_name("image-missing-symbolic");}
+        } else if asset.item.mime == "application/x-tgsticker" {
+            let library=self.library.clone();drop(verified);
+            install_lottie_reopenable(&picture,&spinner,&self.scroll,move||library.reopen_preview(&asset));
+        } else if asset.item.mime.starts_with("image/") {
+            drop(verified);let library=self.library.clone();let preview_asset=asset.clone();
+            // Still frames are cached as small PNGs, so reopening the picker does not decode
+            // every sticker again. Animated artwork is never cached and keeps playing.
+            let cache_root=crate::preview_cache::account_root(self.library.account());
+            let cache_key=crate::preview_cache::key("still",192,&asset.item.file);
+            let cached=poster.and_then(|preview|
+                gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(preview.bytes)).ok());
+            if let Some(texture)=cached {
+                picture.set_paintable(Some(&texture));
                 spinner.stop();
                 spinner.set_visible(false);
-                let playback = player.clone();
-                picture.connect_map(move |_| playback.media.play());
-                picture.connect_unmap(move |_| player.media.pause());
             } else {
-                button.set_icon_name("image-missing-symbolic");
-                button.set_tooltip_text(Some("Animated sticker preview unavailable"));
-            }
-        } else if asset.item.mime == "application/x-tgsticker" {
-            install_lottie(&picture, &spinner, &self.scroll, verified);
-        } else if asset.item.mime.starts_with("image/") {
-            let spinner = spinner.downgrade();
-            let scroll = self.scroll.downgrade();
-            crate::image_loader::play_opened(
-                &picture,
-                verified,
-                192,
-                move |picture| {
-                    scroll.upgrade().is_some_and(|scroll| {
-                        picture.compute_bounds(&scroll).is_some_and(|bounds| {
-                            bounds.y() + bounds.height() >= 0.
-                                && bounds.y() <= scroll.height() as f32
+                let spinner = spinner.downgrade();
+                let scroll = self.scroll.downgrade();
+                crate::image_loader::play_input_with(
+                    &picture,
+                    192,
+                    move |picture| {
+                        scroll.upgrade().is_some_and(|scroll| {
+                            picture.compute_bounds(&scroll).is_some_and(|bounds| {
+                                bounds.y() + bounds.height() >= 0.
+                                    && bounds.y() <= scroll.height() as f32
+                            })
                         })
-                    })
-                },
-                move |picture, texture| {
-                    picture.set_paintable(Some(&texture));
-                    if let Some(spinner) = spinner.upgrade() {
-                        spinner.stop();
-                        spinner.set_visible(false);
-                    }
-                },
-            );
+                    },
+                    move |picture, texture, animated| {
+                        picture.set_paintable(Some(&texture));
+                        if let Some(spinner) = spinner.upgrade() {
+                            spinner.stop();
+                            spinner.set_visible(false);
+                        }
+                        if !animated && let Some(root) = &cache_root {
+                            let root=root.clone();let key=cache_key.clone();let texture=texture.clone();
+                            gio::spawn_blocking(move || crate::preview_cache::store(&root,&key,&texture.save_to_png_bytes()));
+                        }
+                    },
+                    show_preview_error,
+                    true,
+                    move||library.reopen_preview(&preview_asset),
+                );
+            }
         } else {
             spinner.stop();
             spinner.set_visible(false);
@@ -1888,7 +2144,74 @@ impl Drop for PackLibraryPage {
     }
 }
 
+/// Preferences → Behavior: keep the media pane open after a sticker is sent.
+pub(crate) const STICKERS_KEEP_OPEN: &str = "stickers_keep_open";
+
+/// Holding Shift while clicking a sticker always keeps the pane open, whatever the setting.
+fn stickers_stay_open(setting: &str, state: gtk::gdk::ModifierType) -> bool {
+    setting != "false" || state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+}
+
 impl Ui {
+    /// Runs inside the click that sent the sticker, so the keyboard still reports its modifiers.
+    fn after_sticker_sent(self: &Rc<Self>) {
+        let setting = self.store.pref(STICKERS_KEEP_OPEN, "true");
+        let held = gtk::gdk::Display::default()
+            .and_then(|display| display.default_seat())
+            .and_then(|seat| seat.keyboard())
+            .map(|keyboard| keyboard.modifier_state())
+            .unwrap_or_else(gtk::gdk::ModifierType::empty);
+        if !stickers_stay_open(&setting, held) {
+            self.utility.set_show_sidebar(false);
+        }
+    }
+
+    /// Re-imports connected Telegram packs whose last check is older than six hours
+    /// (`Library::due_updates`). Failures are recorded on the pack by `import_telegram`.
+    pub(crate) fn update_due_packs(self: &Rc<Self>) {
+        static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let owner = self.state.borrow().account.clone();
+        if owner.is_empty() || RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let generation = self.generation.get();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let mut updated = false;
+            if let Ok(library) = Library::open(&owner).await
+                && let Ok(due) = library.due_updates().await
+                && !due.is_empty()
+                && library.telegram_enabled().await.unwrap_or(false)
+            {
+                for id in due {
+                    let current = weak
+                        .upgrade()
+                        .is_some_and(|ui| ui.generation.get() == generation && ui.state.borrow().account == owner);
+                    if !current {
+                        break;
+                    }
+                    let source = library
+                        .snapshot()
+                        .await
+                        .ok()
+                        .and_then(|s| s.packs.into_iter().find(|p| p.id == id))
+                        .map(|p| p.source);
+                    if let Some(source) = source
+                        && library.import_telegram(source, Some(id), Job::new()).await.is_ok()
+                    {
+                        updated = true;
+                    }
+                }
+            }
+            RUNNING.store(false, std::sync::atomic::Ordering::Release);
+            if updated && let Some(ui) = weak.upgrade() {
+                for page in ui.pack_pages.borrow().clone() {
+                    page.refresh();
+                }
+            }
+        });
+    }
+
     pub(crate) fn refresh_favorite_views(self: &Rc<Self>) {
         for page in self.pack_pages.borrow().clone() {
             if page.kind == Kind::Stickers {
@@ -1919,6 +2242,7 @@ impl Ui {
                     .modal(true)
                     .build();
                 let filter = gtk::FileFilter::new();
+                filter.add_pattern("*.pack");
                 filter.add_pattern("*.nzsp");
                 filter.add_pattern("*.xmsp");
                 let filters = gio::ListStore::new::<gtk::FileFilter>();
@@ -2057,42 +2381,13 @@ impl Ui {
                 });
                 dialog.present(Some(&self.window));
             }
-            PackLibraryAction::Manage => {
+            PackLibraryAction::Manage => crate::pack_editor::manage(self, page, library, kind),
+            PackLibraryAction::Edit => {
                 let Some(pack) = selected.filter(|id| *id >= 0) else {
                     self.notice("Select a pack first");
                     return;
                 };
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Manage Pack")
-                    .body("Choose what to do with this pack.")
-                    .build();
-                dialog.add_responses(&[("cancel", "Cancel"), ("uninstall", "Uninstall")]);
-                dialog.set_default_response(Some("cancel"));
-                dialog.set_close_response("cancel");
-                dialog.set_response_appearance("uninstall", adw::ResponseAppearance::Destructive);
-                let weak = Rc::downgrade(self);
-                let page = Rc::downgrade(page);
-                dialog.connect_response(Some("uninstall"), move |_, _| {
-                    let Some(ui) = weak.upgrade().filter(|ui| {
-                        ui.generation.get() == generation && ui.state.borrow().account == owner
-                    }) else {
-                        return;
-                    };
-                    let Some(page) = page.upgrade() else {
-                        return;
-                    };
-                    let library = library.clone();
-                    glib::spawn_future_local(async move {
-                        match library
-                            .mutate(crate::packs::Mutation::Installed { pack, value: false })
-                            .await
-                        {
-                            Ok(_) => page.refresh(),
-                            Err(error) => ui.notice(&error.to_string()),
-                        }
-                    });
-                });
-                dialog.present(Some(&self.window));
+                crate::pack_editor::open(self,page,library,pack);
             }
         }
     }
@@ -2231,7 +2526,9 @@ impl Ui {
                         };
                         match selection {
                             PackSelection::Sticker(asset) => {
-                                ui.send_library_file(&asset.path, true);
+                                if ui.send_pack_sticker(&asset) {
+                                    ui.after_sticker_sent();
+                                }
                             }
                             PackSelection::CustomEmoji { item_id, fallback } => {
                                 let weak = Rc::downgrade(&ui);
@@ -2281,8 +2578,8 @@ impl Ui {
                     }
                 }),
             );
-            stickers.root.set_margin_start(10);
-            stickers.root.set_margin_end(10);
+            stickers.root.set_margin_start(0);
+            stickers.root.set_margin_end(0);
             stickers.root.set_margin_bottom(10);
             let sticker_search = Rc::downgrade(&stickers);
             ui.media_search.connect_search_changed(move |search| {
@@ -2297,6 +2594,7 @@ impl Ui {
             crate::emoji_picker_ui::attach_custom_emoji_page(&ui, &emoji);
             ui.pack_library.replace(Some(library));
             ui.pack_pages.replace(vec![stickers, emoji]);
+            ui.open_pending_pack_files();
         });
     }
 
@@ -2316,6 +2614,18 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[test]
+    fn stickers_close_after_sending_only_when_the_setting_is_off_and_shift_is_not_held() {
+        use gtk::gdk::ModifierType as Mod;
+        assert!(stickers_stay_open("true", Mod::empty()), "default keeps the tab open");
+        assert!(stickers_stay_open("", Mod::empty()), "an unset or odd value keeps the tab open");
+        assert!(!stickers_stay_open("false", Mod::empty()));
+        assert!(!stickers_stay_open("false", Mod::CONTROL_MASK | Mod::ALT_MASK), "only Shift overrides");
+        assert!(stickers_stay_open("false", Mod::SHIFT_MASK), "Shift keeps it open");
+        assert!(stickers_stay_open("false", Mod::SHIFT_MASK | Mod::CONTROL_MASK));
+        assert!(stickers_stay_open("true", Mod::SHIFT_MASK));
+    }
+
     fn until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
         let context = glib::MainContext::default();
         let deadline = std::time::Instant::now() + timeout;
@@ -2329,6 +2639,70 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    #[test]
+    #[ignore = "requires isolated native display, xdotool and Secret Service"]
+    fn secondary_click_opens_menu_and_alt_click_favorites_without_sending() {
+        fn find<T:IsA<gtk::Widget>+glib::object::IsClass+Clone+'static>(root:&gtk::Widget,predicate:&impl Fn(&T)->bool)->Option<T>{if let Ok(widget)=root.clone().downcast::<T>(){if predicate(&widget){return Some(widget);}}let mut child=root.first_child();while let Some(widget)=child{child=widget.next_sibling();if let Some(found)=find(&widget,predicate){return Some(found);}}None}
+        fn click(window:&gtk::Window,button:&gtk::Button,number:&str,alt:bool){
+            let out=std::process::Command::new("xdotool").args(["search","--onlyvisible","--pid",&std::process::id().to_string(),"--name","Monogram Menu Fixture"]).output().unwrap();let id=String::from_utf8(out.stdout).unwrap().lines().next().unwrap().to_owned();let rect=button.compute_bounds(window).unwrap();let x=(rect.x()+rect.width()/2.)as i32;let y=(rect.y()+rect.height()/2.)as i32;let number=number.to_string();let task=std::thread::spawn(move||{let mut command=std::process::Command::new("xdotool");command.args(["mousemove","--window",&id,&x.to_string(),&y.to_string()]);if alt{command.args(["keydown","Alt_L"]);}command.args(["click",&number]);if alt{command.args(["keyup","Alt_L"]);}assert!(command.status().unwrap().success());});assert!(until(Duration::from_secs(3),||task.is_finished()));task.join().unwrap();
+        }
+        gtk::init().unwrap();let context=glib::MainContext::default();let path=std::env::temp_dir().join(format!("menu-fixture-{}.png",uuid::Uuid::new_v4()));let bytes=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=").unwrap();std::fs::write(&path,bytes).unwrap();
+        let library=context.block_on(Library::open("menu@fixture.invalid")).unwrap();let pack=context.block_on(library.create("Menu pack".into(),Kind::Stickers,vec![crate::packs::Input{path:path.clone(),name:"Menu fixture".into(),emoji:"🙂".into()}],Job::new())).unwrap();let _=std::fs::remove_file(path);
+        let selected=Rc::new(Cell::new(0));let count=selected.clone();let page=PackLibraryPage::new(library,Kind::Stickers,std::rc::Weak::new(),None,move |_|count.set(count.get()+1),|_|{},|_,_,_|{});let window=gtk::Window::builder().title("Monogram Menu Fixture").child(&page.root).default_width(420).default_height(600).build();window.present();page.refresh();
+        let tile=||find::<gtk::Button>(&window.clone().upcast(),&|b|b.tooltip_text().as_deref()==Some("Menu fixture"));assert!(until(Duration::from_secs(6),||tile().is_some_and(|tile|tile.is_mapped()&&tile.width()>0&&tile.height()>0)&&page.preview_active.get()==0));
+        click(&window,&tile().unwrap(),"3",false);assert!(until(Duration::from_secs(3),||find::<gtk::Popover>(&window.clone().upcast(),&|p|p.is_mapped()).is_some()));assert!(find::<gtk::Popover>(&window.clone().upcast(),&|p|p.is_mapped()).unwrap().has_css_class("message-menu"),"nested popover backdrop returned");assert!(page.favorites.borrow().is_empty());assert_eq!(selected.get(),0);
+        find::<gtk::Popover>(&window.clone().upcast(),&|p|p.is_mapped()).unwrap().popdown();assert!(until(Duration::from_secs(3),||find::<gtk::Popover>(&window.clone().upcast(),&|p|p.is_mapped()).is_none()));click(&window,&tile().unwrap(),"1",true);assert!(until(Duration::from_secs(4),||page.favorites.borrow().contains(&pack.items[0].id)));assert_eq!(selected.get(),0);
+        assert!(until(Duration::from_secs(4),||tile().is_some_and(|tile|tile.is_mapped()&&tile.width()>0&&tile.height()>0)&&page.preview_active.get()==0));click(&window,&tile().unwrap(),"3",false);assert!(until(Duration::from_secs(3),||find::<gtk::Button>(&window.clone().upcast(),&|b|b.label().as_deref()==Some("Remove from Favorites")).is_some()));assert!(page.favorites.borrow().contains(&pack.items[0].id));find::<gtk::Button>(&window.clone().upcast(),&|b|b.label().as_deref()==Some("Remove from Favorites")).unwrap().emit_clicked();assert!(until(Duration::from_secs(4),||!page.favorites.borrow().contains(&pack.items[0].id)));assert_eq!(selected.get(),0);window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated native display and Secret Service"]
+    fn large_image_pack_does_not_retain_offscreen_file_descriptors() {
+        gtk::init().unwrap();let context=glib::MainContext::default();
+        let bytes=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=").unwrap();
+        let path=std::env::temp_dir().join(format!("picker-image-{}.png",uuid::Uuid::new_v4()));std::fs::write(&path,bytes).unwrap();
+        let library=context.block_on(Library::open("image-grid@fixture.invalid")).unwrap();
+        let inputs=(0..700).map(|i|crate::packs::Input{path:path.clone(),name:format!("Image {i}"),emoji:"🙂".into()}).collect();
+        context.block_on(library.create("Images".into(),Kind::Stickers,inputs,Job::new())).unwrap();let _=std::fs::remove_file(path);
+        let page=PackLibraryPage::new(library,Kind::Stickers,std::rc::Weak::new(),None,|_|{},|_|{},|_,_,_|{});
+        let window=gtk::Window::builder().child(&page.root).default_width(420).default_height(600).build();
+        let descriptors=||std::fs::read_dir("/proc/self/fd").unwrap().count();let baseline=descriptors();let peak=Rc::new(Cell::new(baseline));let(p,last,gap)=(peak.clone(),Rc::new(Cell::new(std::time::Instant::now())),Rc::new(Cell::new(Duration::ZERO)));let g=gap.clone();
+        let heartbeat=glib::timeout_add_local(Duration::from_millis(16),move||{p.set(p.get().max(descriptors()));g.set(g.get().max(last.replace(std::time::Instant::now()).elapsed()));glib::ControlFlow::Continue});
+        window.present();page.refresh();assert!(until(Duration::from_secs(12),||page.model.n_items()>100&&page.preview_active.get()==0));
+        for _ in 0..3 {let a=page.scroll.vadjustment();a.set_value((a.upper()-a.page_size()).max(0.));let _=until(Duration::from_millis(350),||false);a.set_value(0.);let _=until(Duration::from_millis(350),||false);}
+        window.close();let _=until(Duration::from_millis(200),||false);heartbeat.remove();
+        assert!(peak.get()<baseline+128,"Offscreen images pinned files: base {baseline}, peak {}",peak.get());
+        assert!(gap.get()<Duration::from_millis(400),"Image pack blocked GTK for {:?}",gap.get());
+        println!("Image grid700, scroll6: descriptor baseline {baseline}, peak {}, UI gap {:?}",peak.get(),gap.get());
+    }
+
+    #[test]
+    #[ignore = "requires isolated native display, Secret Service and media plugins"]
+    fn video_sticker_grid_bounds_descriptors_and_keeps_input_responsive() {
+        gtk::init().unwrap();let context=glib::MainContext::default();
+        let path=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/picker-video.webm");
+        let library=context.block_on(Library::open("video-grid@fixture.invalid")).unwrap();
+        let inputs=(0..48).map(|i|crate::packs::Input{path:path.clone(),name:format!("Video {i}"),emoji:"🙂".into()}).collect();
+        let pack=context.block_on(library.create("Videos".into(),Kind::Stickers,inputs,Job::new())).unwrap();
+        let page=PackLibraryPage::new(library,Kind::Stickers,std::rc::Weak::new(),None,|_|{},|_|{},|_,_,_|{});
+        let image=gtk::Picture::new();image.set_size_request(24,24);page.root.append(&image);
+        let window=gtk::Window::builder().child(&page.root).default_width(420).default_height(600).build();
+        let descriptors=||std::fs::read_dir("/proc/self/fd").unwrap().count();let baseline=descriptors();let peak=Rc::new(Cell::new(baseline));let gap=Rc::new(Cell::new(Duration::ZERO));let last=Rc::new(Cell::new(std::time::Instant::now()));
+        let(p,g,l)=(peak.clone(),gap.clone(),last.clone());let heartbeat=glib::timeout_add_local(Duration::from_millis(16),move||{p.set(p.get().max(descriptors()));g.set(g.get().max(l.replace(std::time::Instant::now()).elapsed()));glib::ControlFlow::Continue});
+        window.present();page.refresh();
+        assert!(until(Duration::from_secs(12),||page.model.n_items()>0&&page.preview_active.get()==0&&page.preview_queue.borrow().len()<48));
+        let icon=page.section_buttons.borrow()[&pack.id].child().unwrap().downcast::<gtk::Overlay>().unwrap().child().unwrap().next_sibling().unwrap().downcast::<gtk::Picture>().unwrap();
+        assert!(until(Duration::from_secs(4),||icon.paintable().is_some()),"animated pack icon loads its playback stream");
+        assert!(icon.paintable().unwrap().is::<gtk::MediaStream>(),"video pack icon is live rather than a first-frame texture");
+        assert!(page.video_preview.borrow().is_none(),"A tile must not keep a full video player alive");
+        let poster=gtk::gdk::MemoryTexture::new(1,1,gtk::gdk::MemoryFormat::R8g8b8a8,&glib::Bytes::from_owned(vec![0u8;4]),4).upcast::<gtk::gdk::Texture>();
+        for _ in 0..8 {page.start_video_preview(pack.items[0].id,&image,&poster);assert!(until(Duration::from_secs(4),||page.video_preview.borrow().is_some()));page.stop_video_preview();let _=until(Duration::from_millis(100),||false);}
+        window.close();let _=until(Duration::from_millis(200),||false);heartbeat.remove();
+        assert!(peak.get()<baseline+192,"Unbounded video descriptors: base {baseline}, peak {}",peak.get());
+        assert!(gap.get()<Duration::from_millis(400),"Video picker froze for {:?}",gap.get());
+        println!("Video grid48, hover8: descriptor baseline {baseline}, peak {}, max UI gap {:?}",peak.get(),gap.get());
     }
 
     #[test]
@@ -3153,5 +3527,143 @@ mod gif_native_tests {
         println!(
             "FAVORITE DRAG PASS GIFs and actual database reload: membership and recents unchanged, no attachment staged"
         );
+    }
+}
+
+#[cfg(test)]
+mod lottie_queue_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn settle(milliseconds: u64) {
+        let context = glib::MainContext::default();
+        let until = std::time::Instant::now() + Duration::from_millis(milliseconds);
+        while std::time::Instant::now() < until {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A window with `count` 4 px pictures in a grid, all inside the visible area.
+    fn grid(count: usize) -> (gtk::Window, gtk::ScrolledWindow, Vec<gtk::Picture>, gtk::Spinner) {
+        gtk::init().expect("display");
+        let grid = gtk::Grid::new();
+        let mut pictures = Vec::new();
+        for index in 0..count {
+            let picture = gtk::Picture::new();
+            picture.set_size_request(4, 4);
+            grid.attach(&picture, (index % 10) as i32, (index / 10) as i32, 1, 1);
+            pictures.push(picture);
+        }
+        let scroll = gtk::ScrolledWindow::builder().child(&grid).build();
+        let window = gtk::Window::builder().default_width(300).default_height(300).child(&scroll).build();
+        window.present();
+        settle(300);
+        (window, scroll, pictures, gtk::Spinner::new())
+    }
+
+    fn counting_source(calls: &Arc<AtomicUsize>) -> LottieSource {
+        let calls = calls.clone();
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("a test source that opens nothing")
+        })
+    }
+
+    /// Take every decoder slot so later starts have to queue, as they do while a pack scrolls.
+    fn hold_all_slots() -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let held = Rc::new(RefCell::new(Vec::new()));
+        for _ in 0..4 {
+            let held = held.clone();
+            glib::spawn_future_local(async move {
+                held.borrow_mut().push(lottie_permit().await);
+            });
+        }
+        settle(100);
+        assert_eq!(held.borrow().len(), 4, "all four slots are taken");
+        Rc::try_unwrap(held).ok().unwrap().into_inner()
+    }
+
+    #[gtk::test]
+    #[ignore = "requires a native display"]
+    fn tiles_that_scrolled_away_while_queued_are_skipped_so_the_ones_in_view_are_not_held_up() {
+        let (_window, scroll, pictures, spinner) = grid(50);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slots = hold_all_slots();
+        let serials: Vec<Rc<Cell<u64>>> = pictures.iter().map(|_| Rc::new(Cell::new(0))).collect();
+        for (picture, serial) in pictures.iter().zip(&serials) {
+            start_lottie(picture, &spinner, &scroll, counting_source(&calls), serial.clone());
+        }
+        // A quick jump to the end: all but the last tile are unmapped again, which is what bumps
+        // the serial, while their decodes are still waiting for a slot.
+        for serial in &serials[..49] {
+            serial.set(serial.get().wrapping_add(1));
+        }
+        drop(slots);
+        settle(800);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "only the tile still on screen opened its sticker, not all 50");
+    }
+
+    #[gtk::test]
+    #[ignore = "requires a native display"]
+    fn a_tile_that_is_still_wanted_is_not_skipped_and_starts_as_soon_as_a_slot_frees() {
+        let (_window, scroll, pictures, spinner) = grid(8);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slots = hold_all_slots();
+        let serials: Vec<Rc<Cell<u64>>> = pictures.iter().map(|_| Rc::new(Cell::new(0))).collect();
+        for (picture, serial) in pictures.iter().zip(&serials) {
+            start_lottie(picture, &spinner, &scroll, counting_source(&calls), serial.clone());
+        }
+        settle(100);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing opens while every slot is busy");
+        drop(slots);
+        settle(800);
+        assert_eq!(calls.load(Ordering::SeqCst), 8, "every tile that stayed in view got its turn");
+    }
+
+    #[gtk::test]
+    #[ignore = "requires a native display"]
+    fn a_tile_that_was_destroyed_while_waiting_does_not_open_anything() {
+        let (window, scroll, pictures, spinner) = grid(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slots = hold_all_slots();
+        let serial = Rc::new(Cell::new(0));
+        start_lottie(&pictures[0], &spinner, &scroll, counting_source(&calls), serial);
+        // Take the whole tree down: the window lets go of the scroller, and nothing else holds it.
+        window.set_child(gtk::Widget::NONE);
+        drop(pictures);
+        drop(scroll);
+        settle(100);
+        drop(slots);
+        settle(500);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[gtk::test]
+    #[ignore = "requires a native display"]
+    fn a_tile_beyond_the_edge_waits_for_view_instead_of_taking_a_slot_ahead_of_visible_ones() {
+        gtk::init().expect("display");
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let mut pictures = Vec::new();
+        for _ in 0..40 {
+            let picture = gtk::Picture::new();
+            picture.set_size_request(60, 60);
+            column.append(&picture);
+            pictures.push(picture);
+        }
+        let scroll = gtk::ScrolledWindow::builder().child(&column).build();
+        let window = gtk::Window::builder().default_width(200).default_height(200).child(&scroll).build();
+        window.present();
+        settle(300);
+        let spinner = gtk::Spinner::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let far = Rc::new(Cell::new(0));
+        start_lottie(&pictures[39], &spinner, &scroll, counting_source(&calls), far);
+        settle(600);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the 40th tile is far below the view and opens nothing yet");
+        let near = Rc::new(Cell::new(0));
+        start_lottie(&pictures[0], &spinner, &scroll, counting_source(&calls), near);
+        settle(600);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the tile in view opens at once");
     }
 }

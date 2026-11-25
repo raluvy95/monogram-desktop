@@ -1,5 +1,45 @@
 # Live attachment reception and downloads
 
+Automatic OMEMO2 upload approval is carried from the encryption preflight into
+the upload worker. Its intentionally uncacheable selection must not be looked
+up again to start or finish that same upload. Retry performs a fresh preflight;
+completion still fences account/session generation, encryption-settings revision,
+explicit mode, draft mode and local fingerprint. This preserves blind-trust
+behavior without permitting plaintext fallback or bypassing the final encrypted
+send. `approved_pq_upload_survives_uncacheable_selection_but_not_policy_changes`
+covers approval retention and rejection after policy changes.
+
+The final handoff after snapshot caching uses the same approval/revision guard.
+An already uploaded attachment retry performs a fresh preflight and reuses its
+encrypted reference when the mode and local identity match. A cache miss alone
+never means the file must be selected again. The isolated native test
+`approved_pq_upload_submits_after_snapshot_staging_without_a_cached_choice`
+drives a completed upload through caching to a fake `Command::Send` receiver.
+
+Upload requests use the shared HTTPS security policy without the downloader's
+30-second response-header read deadline: in reqwest 0.13.5 that timer also runs
+while the request body is being sent. Uploads instead watch for 30 seconds with
+no body progress and start their separate acknowledgement deadline only after
+the body is consumed. A timeout never counts as server acceptance; the existing
+single fresh-slot retry and immutable snapshot remain. Local HTTPS regressions
+reproduce the former deadline on a healthy slow body and verify the upload
+client finishes it, plus missing acknowledgements, rejection and cancellation.
+Saved HTTP diagnostics distinguish body completion from a body stall.
+
+Pending encryption preflight and worker startup keep the final media-style tile
+in a cancellable preparation state. The absence of a worker alone is not an
+interruption. The tile follows current retry/error state instead of retaining an
+old error captured when the widget was built.
+
+Message Details shows local failure history before routine message metadata,
+including stage, UTC time, safe HTTP PUT status/transport category, encryption
+validation reason and XMPP condition/type/code when supplied. Up to eight records
+per message survive retries and successful delivery; message/account deletion
+removes them. Copy buttons export the displayed diagnostics. URLs, credentials,
+key-shaped hexadecimal values and raw XML are excluded. Historical attempts
+whose errors were never saved cannot be reconstructed. Mobile retains equivalent
+durable failure details and exposes a native selectable/copyable diagnostic view.
+
 Desktop advertises SFS support, receives direct/room file messages in plaintext,
 Legacy OMEMO and direct OMEMO 2, and offers
 manual Download, Cancel, Retry and native Save As. The reference is mobile's
@@ -11,6 +51,14 @@ Inline media preserves aspect ratio within 420 × 360 pixels; stickers stay
 borderless within 256 × 256 pixels. Known metadata sizes the progress placeholder
 before decode. Retained rows keep following account-owned download/decode jobs
 across reconnects and map/unmap cycles.
+
+Video previews in the timeline play muted. Clapper can announce its own "not muted" state shortly
+after a preview is ready, so a preview is put back to muted for 1.5 seconds after that, and then left
+alone: it is never muted again behind anyone's back. A player the viewer is showing (`expanded`) or
+a round video that was tapped is never touched at all. This used to be a check on every 150 ms poll
+for as long as the tile existed, which meant that opening a video in the viewer, or unmuting the app
+in the system mixer, was undone within a fraction of a second ("it keeps muting"). Tests:
+`video_ui::video_audio_tests`.
 
 Round-video messages use mobile's `round_video_*.mp4` filename marker only after
 verified local playback confirms a video track, positive duration, and square
@@ -100,6 +148,14 @@ local path. Sending creates durable local pending messages and clears the compos
 only after persistence. The first selected file carries the caption; selections
 currently send as independent files rather than a media album.
 
+Pending photos, videos, GIFs and stickers keep their media tile instead of a
+filename/progress-bar row. Local image decoding and video poster extraction run
+outside GTK; unavailable or non-local previews retain a neutral media tile.
+Uploads and downloads share the circular progress indicator, with Cancel while
+running and Retry after interruption. The timestamp shows the sending spinner
+until completion, and captions/replies retain their normal layout. Ordinary
+documents keep their file upload controls.
+
 [XEP-0363](https://xmpp.org/extensions/xep-0363.html) discovery queries the account
 server and its advertised services. Provider limits include the encrypted 16-byte
 tag and are checked before copying a known-size source. Unknown-size sources are
@@ -118,23 +174,21 @@ inside the protected SFS description. PUT credentials are restricted to the
 XEP's Authorization/Cookie/Expires headers. CR/LF is rejected, redirects are
 refused, and only HTTP 200/201/204 after complete body generation permits sending.
 
-After the body is consumed, a three-second response-header wait may reconnect
-once; the final request retains the normal 30-second read timeout. Transport
-failures may also trigger that one recovery. The repeated PUT
-uses the same slot, headers and byte-identical wire snapshot, following
-[RFC 9110 section 9.2.2](https://www.rfc-editor.org/rfc/rfc9110.html#name-idempotent-methods).
-It never re-encrypts changed plaintext under the original nonce. HTTP rejections
-are not retried. The UI shows confirmation and reconnection states; cancellation
-and the existing owner/generation checks still fence publication. A failed
-recovery returns an error and leaves explicit Retry available. That recovery is
-bounded connection handling, not a correction to the external server.
+After the body is consumed, uploads retain a 30-second acknowledgement timeout.
+A transport failure or HTTP 409 requests one fresh, validated XEP-0363 slot;
+recovery never repeats a possibly committed PUT to the same slot. It reuses
+byte-identical ciphertext, headers from the replacement slot, and the original
+key/nonce. Only the successful slot's GET URL becomes the attachment URL. A
+provider that repeats the occupied PUT URL is refused. Other HTTP rejections
+and cancellation do not retry. The UI keeps reporting upload/reconnection state
+on its worker, and owner/generation checks continue fencing publication.
 
-The local TLS fixture confirms identical encrypted bytes and allowed headers on
-two connections to the same slot, one recovery at most, no replay after HTTP
-403 or cancellation, and rejection of a changed plaintext snapshot. Three cold
-production uploads of synthetic 8 KiB files completed in 3.86–4.10 seconds without
-manual restart; each resulting attachment passed authenticated decryption and
-SHA-256 verification on download. No contact message was sent.
+Local TLS regressions verify a withheld acknowledgement and an explicit 409,
+different recovery PUT URLs, identical payloads, replacement GET selection,
+one recovery at most, and no replay after HTTP 403 or cancellation. Mobile's
+matching encrypted regression also passes using the reported 8,522,645-byte
+MP4 as input. These controlled checks do not establish the original server's
+exact reason for returning 409; an actual phone retry remains necessary.
 
 A pending placeholder is never an immutable wire-message base and cannot be
 submitted by the XMPP or crypto send path. After a successful upload, owner,
@@ -253,3 +307,17 @@ playback progress. Pause, loop and seeking reanchor the presentation; explicit
 seek preview survives in-flight seeks. Frame callbacks stop for paused/unmapped
 streams and after samples stop. The native acceptance observes90frames in1.5s
 (16.7ms average,17.1ms maximum) with existing seeking/mute/play-pause checks passing.
+
+Clipboard image/file paste works with Ctrl+V or Shift+Insert anywhere in the
+focused chat window, including media search and other chat controls. The native
+composer Paste menu uses the same handler. Ordinary text paste continues to the
+focused input. Modal dialogs keep their own clipboard behavior; staging captures
+the active account/chat and rejects completion after either changes.
+
+Ordinary files never download automatically. Download opens the native save picker
+before any transfer or cache hashing, and writes verified bytes to the selected
+destination when ready, including after leaving the conversation. Cancelling the
+picker starts no transfer. Photos, videos, audio and stickers retain automatic
+media downloads with the configured size limit (15 MB by default). Explicit pack
+attachments retain their native Open Pack flow. The same document policy and
+save-picker-first behavior apply on Android through DocumentsUI.

@@ -45,10 +45,11 @@ static void refresh (MonogramVideo *self) {
   if (gtk_media_stream_is_prepared (stream) && duration > 0 &&
       gtk_media_stream_get_duration (stream) == 0)
     gtk_media_stream_stream_unprepared (stream);
-  if (!gtk_media_stream_is_prepared (stream) && self->width > 0 && self->paintable &&
-      gdk_paintable_get_intrinsic_width (self->paintable) > 1) {
-    gboolean audio = clapper_stream_list_get_n_streams (clapper_player_get_audio_streams (self->player)) > 0;
-    gtk_media_stream_stream_prepared (stream, audio, TRUE, TRUE, duration * G_USEC_PER_SEC);
+  gboolean audio = clapper_stream_list_get_n_streams (clapper_player_get_audio_streams (self->player)) > 0;
+  gboolean video_ready = self->width > 0 && self->paintable && gdk_paintable_get_intrinsic_width (self->paintable) > 1;
+  gboolean audio_ready = audio && clapper_stream_list_get_n_streams (videos) == 0 && duration > 0;
+  if (!gtk_media_stream_is_prepared (stream) && (video_ready || audio_ready)) {
+    gtk_media_stream_stream_prepared (stream, audio, video_ready, duration > 0, duration * G_USEC_PER_SEC);
   }
   ClapperPlayerState state = clapper_player_get_state (self->player);
   if (state == CLAPPER_PLAYER_STATE_PLAYING || state == CLAPPER_PLAYER_STATE_PAUSED)
@@ -56,6 +57,11 @@ static void refresh (MonogramVideo *self) {
   gboolean ended = state == CLAPPER_PLAYER_STATE_STOPPED ||
       (state == CLAPPER_PLAYER_STATE_PAUSED && duration > 0 &&
        clapper_player_get_position (self->player) >= duration - .05);
+  /* Expose Clapper's EOS to still-first motion photos and GTK replay callers. */
+  if (ended && self->has_played && !self->starting &&
+      !gtk_media_stream_get_loop (stream) && gtk_media_stream_is_prepared (stream) &&
+      !gtk_media_stream_get_ended (stream))
+    gtk_media_stream_stream_ended (stream);
   if (self->replay) gtk_widget_set_visible (self->replay,
       ended && self->has_played && !gtk_media_stream_get_loop (stream));
   if (item) g_object_unref (item);
@@ -193,32 +199,70 @@ static void monogram_video_class_init (MonogramVideoClass *klass) {
 }
 static void monogram_video_init (MonogramVideo *self) { self->gtk_volume = 1; }
 
-static GtkWidget *sink_widget (GstElement *sink) {
-  GtkWidget *widget = NULL;
-  if (g_object_class_find_property (G_OBJECT_GET_CLASS (sink), "widget"))
-    g_object_get (sink, "widget", &widget, NULL);
-  if (!widget && GST_IS_BIN (sink)) {
-    GstIterator *iterator = gst_bin_iterate_recurse (GST_BIN (sink));
-    GValue value = G_VALUE_INIT;
-    while (gst_iterator_next (iterator, &value) == GST_ITERATOR_OK) {
-      GstElement *child = g_value_get_object (&value);
-      if (g_object_class_find_property (G_OBJECT_GET_CLASS (child), "widget"))
-        g_object_get (child, "widget", &widget, NULL);
-      g_value_unset (&value);
-      if (widget) break;
-    }
-    gst_iterator_free (iterator);
-  }
-  return widget;
-}
-
 static void replay_clicked (GtkButton *button, MonogramVideo *self) {
   gtk_widget_set_visible (self->replay, FALSE);
   clapper_player_seek (self->player, 0);
   clapper_player_play (self->player);
 }
 
-gboolean monogram_playback_init (void) { return clapper_init_check (NULL, NULL); }
+/* Clapper only ever plays local, already verified files (/proc/self/fd/N). GStreamer will still
+ * follow network URLs that it finds *inside* a file: an HLS, DASH or Smooth Streaming manifest
+ * saved as ".mp4" makes it fetch arbitrary hosts, with no DNS pinning or private-address check.
+ * Give every network source and adaptive demuxer rank NONE so decodebin and uridecodebin never
+ * pick one. Fails closed: if this cannot be established, playback stays unavailable. */
+static const char *const blocked_elements[] = {
+  "hlsdemux", "hlsdemux2", "dashdemux", "dashdemux2", "mssdemux", "mssdemux2",
+  "souphttpsrc", "curlhttpsrc", "rtspsrc", "udpsrc", "tcpclientsrc", "srtsrc", "rtmpsrc", "rtmp2src", NULL
+};
+static gboolean network_factory (GstElementFactory *factory) {
+  const gchar *klass = gst_element_factory_get_metadata (factory, GST_ELEMENT_METADATA_KLASS);
+  const gchar *name = gst_plugin_feature_get_name (GST_PLUGIN_FEATURE (factory));
+  if (klass && (strstr (klass, "Network") || strstr (klass, "Adaptive"))) return TRUE;
+  for (const char *const *blocked = blocked_elements; *blocked; blocked++)
+    if (!strcmp (name, *blocked)) return TRUE;
+  return FALSE;
+}
+static void block_network_elements (void) {
+  GList *all = gst_registry_get_feature_list (gst_registry_get (), GST_TYPE_ELEMENT_FACTORY);
+  for (GList *l = all; l; l = l->next)
+    if (network_factory (GST_ELEMENT_FACTORY (l->data)))
+      gst_plugin_feature_set_rank (GST_PLUGIN_FEATURE (l->data), GST_RANK_NONE);
+  gst_plugin_feature_list_free (all);
+}
+/* TRUE when no network source or adaptive demuxer is selectable any more. Sources keep working
+ * for an explicit http URI (gst_element_make_from_uri ignores rank), but nothing here supplies
+ * one: only adaptive demuxers could turn file contents into a network request. */
+gboolean monogram_playback_network_blocked (void) {
+  GList *all = gst_registry_get_feature_list (gst_registry_get (), GST_TYPE_ELEMENT_FACTORY);
+  gboolean blocked = TRUE;
+  for (GList *l = all; l; l = l->next)
+    if (network_factory (GST_ELEMENT_FACTORY (l->data))
+        && gst_plugin_feature_get_rank (GST_PLUGIN_FEATURE (l->data)) != GST_RANK_NONE) blocked = FALSE;
+  gst_plugin_feature_list_free (all);
+  return blocked;
+}
+/* Plays `uri` headless for up to `ms` and returns once it errors, ends or the time is up. Used by
+ * tests to prove that a manifest saved as a media file does not start a network request. */
+void monogram_playback_probe (const char *uri, guint ms) {
+  GstElement *play = gst_element_factory_make ("playbin3", NULL);
+  GstElement *video = gst_element_factory_make ("fakesink", NULL);
+  GstElement *audio = gst_element_factory_make ("fakesink", NULL);
+  if (!play || !video || !audio) { if (play) gst_object_unref (play); return; }
+  g_object_set (play, "uri", uri, "video-sink", video, "audio-sink", audio, NULL);
+  GstBus *bus = gst_element_get_bus (play);
+  gst_element_set_state (play, GST_STATE_PLAYING);
+  GstMessage *done = gst_bus_timed_pop_filtered (bus, (GstClockTime) ms * GST_MSECOND,
+                                                 GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+  if (done) gst_message_unref (done);
+  gst_element_set_state (play, GST_STATE_NULL);
+  gst_object_unref (bus);
+  gst_object_unref (play);
+}
+gboolean monogram_playback_init (void) {
+  if (!clapper_init_check (NULL, NULL)) return FALSE;
+  block_network_elements ();
+  return monogram_playback_network_blocked ();
+}
 
 GtkMediaStream *monogram_video_new (const char *uri, GtkWidget **controls, GtkWidget **replay) {
   MonogramVideo *self = g_object_new (monogram_video_get_type (), NULL);
@@ -237,17 +281,16 @@ GtkMediaStream *monogram_video_new (const char *uri, GtkWidget **controls, GtkWi
   gtk_widget_add_css_class (self->replay, "osd");
   gtk_widget_add_css_class (self->replay, "pill");
   g_signal_connect_object (self->replay, "clicked", G_CALLBACK (replay_clicked), self, 0);
-  /* Obtain only the sink picture, excluding Clapper's status/icon paintables. */
-  GstElement *sink = clapper_player_get_video_sink (self->player);
-  GtkWidget *picture = sink ? sink_widget (sink) : NULL;
-  if (picture && GTK_IS_PICTURE (picture)) {
-    GdkPaintable *paintable = gtk_picture_get_paintable (GTK_PICTURE (picture));
-    if (paintable) self->paintable = g_object_ref (paintable);
-    gtk_picture_set_can_shrink (GTK_PICTURE (picture), TRUE);
-    gtk_widget_set_opacity (picture, 0);
+  /* Clapper 0.10's own sink tags HDR pixels as sRGB. This upstream GTK
+   * sink retains negotiated high-bit-depth formats and CICP color states. */
+  GstElement *sink=gst_element_factory_make("gtk4paintablesink",NULL);
+  if (sink) {
+    gst_object_ref_sink(sink);
+    /* Its GTK paintable must be created on this UI thread, before preroll. */
+    g_object_get(sink,"paintable",&self->paintable,NULL);
+    clapper_player_set_video_sink(self->player,sink);
+    gst_object_unref(sink);
   }
-  g_clear_object (&picture);
-  g_clear_object (&sink);
   if (!self->paintable) {
     g_object_unref (self);
     return NULL;

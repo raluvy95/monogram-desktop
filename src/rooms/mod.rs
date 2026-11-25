@@ -2,6 +2,7 @@
 pub mod archive;
 mod bookmarks;
 pub mod discovery;
+pub mod hats;
 pub mod invitations;
 pub mod manage;
 pub mod members;
@@ -26,6 +27,29 @@ use tokio_xmpp::{jid::Jid, minidom::Element};
 const CLIENT: &str = "jabber:client";
 const MAX_XML: usize = 1024 * 1024;
 
+const NOT_PRIVATE: &str =
+    "This room is not members-only and non-anonymous, so it cannot be end-to-end encrypted";
+const OCCUPANT_NOT_LISTED: &str =
+    " is in this room but is not a listed member or hides their address, so the message cannot be encrypted for them";
+/// What the user can open to deal with a room failure shown as text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fix {
+    /// Conversation Security, to choose how this room is sent.
+    Security,
+    /// The participants panel, to see who is in the room.
+    Participants,
+}
+/// The place that deals with a room failure, for the text the user saw.
+pub fn fix_for(reason: &str) -> Option<Fix> {
+    if reason == NOT_PRIVATE {
+        Some(Fix::Security)
+    } else if reason.ends_with(OCCUPANT_NOT_LISTED) {
+        Some(Fix::Participants)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     Invalid,
@@ -36,7 +60,12 @@ pub enum Error {
     Forbidden,
     Locked,
     Encryption,
+    /// The room's member list is not ready, or changed while the message was prepared.
     RecipientsUnavailable,
+    /// The room is not members-only and non-anonymous, so it can never be end-to-end encrypted.
+    NotPrivate,
+    /// Someone in the room is not a listed member or hides their address (the nickname).
+    OccupantNotListed(String),
     BookmarkPrivacyUnavailable,
     Cancelled,
     OperationBusy,
@@ -59,6 +88,16 @@ impl fmt::Display for Error {
                 "Joined {room}, but its password could not be saved in the system keyring. The room is still joined."
             );
         }
+        if let Self::OccupantNotListed(nick) = self {
+            return write!(f, "{nick}{OCCUPANT_NOT_LISTED}");
+        }
+        if let Self::Request(iq::Error::Rejected { condition, .. }) = self {
+            return write!(
+                f,
+                "The server refused the room request: {}",
+                condition.replace('-', " ")
+            );
+        }
         f.write_str(match self {
             Self::Invalid => "Invalid room address, nickname or server response",
             Self::Request(iq::Error::Timeout) => {
@@ -74,7 +113,9 @@ impl fmt::Display for Error {
             Self::Encryption => {
                 "Encrypted room sending is unavailable. Your encryption setting is unchanged."
             }
-            Self::RecipientsUnavailable => "The room must disclose a complete members-only recipient list before encryption can be prepared",
+            Self::RecipientsUnavailable => "The room's member list is not ready or changed while the message was prepared; try again",
+            Self::NotPrivate => NOT_PRIVATE,
+            Self::OccupantNotListed(_) => unreachable!("written above"),
             Self::BookmarkPrivacyUnavailable => "Private bookmark synchronization is unavailable. This room choice stays on this device.",
             Self::Cancelled => "The room operation was cancelled because the connection or room changed.",
             Self::OperationBusy => "Another operation for this room is still running.",
@@ -125,4 +166,59 @@ fn child<'a>(xml: &'a Element, name: &str, namespace: &str) -> Result<Option<&'a
         return Err(Error::Invalid);
     }
     Ok(value)
+}
+
+/// A multi-session nickname may disclose one item per resource (XEP-0045 §19.2).
+/// Collapse those resources only when they agree on identity and permissions.
+fn user_item(user: &Element) -> Result<Option<&Element>> {
+    const USER: &str = "http://jabber.org/protocol/muc#user";
+    let mut items = user.children().filter(|item| item.is("item", USER));
+    let Some(first) = items.next() else {
+        return Ok(None);
+    };
+    let mut count = 1;
+    for item in items {
+        count += 1;
+        if count > 128
+            || ["role", "affiliation", "nick"]
+                .iter()
+                .any(|key| first.attr(*key) != item.attr(*key))
+        {
+            return Err(Error::Invalid);
+        }
+        let identity = |item: &Element| -> Result<String> {
+            let jid = item
+                .attr("jid")
+                .ok_or(Error::Invalid)?
+                .parse::<Jid>()
+                .map_err(|_| Error::Invalid)?;
+            if jid.node().is_none() {
+                return Err(Error::Invalid);
+            }
+            Ok(jid.to_bare().to_string())
+        };
+        if identity(first)? != identity(item)? {
+            return Err(Error::Invalid);
+        }
+    }
+    Ok(Some(first))
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+
+    #[test]
+    fn each_room_failure_text_leads_to_the_place_that_deals_with_it() {
+        assert_eq!(fix_for(&Error::NotPrivate.to_string()), Some(Fix::Security));
+        assert_eq!(fix_for(&Error::OccupantNotListed("lurker".into()).to_string()), Some(Fix::Participants));
+        assert_eq!(
+            Error::NotPrivate.to_string(),
+            "This room is not members-only and non-anonymous, so it cannot be end-to-end encrypted"
+        );
+        for other in [Error::RecipientsUnavailable, Error::NotJoined, Error::Forbidden, Error::Invalid] {
+            assert_eq!(fix_for(&other.to_string()), None, "{other:?}");
+        }
+        assert_eq!(fix_for("The server said: lurker is in this room"), None, "lookalike text");
+    }
 }

@@ -1,4 +1,4 @@
-use crate::{model::*, ui::Ui, widgets::*};
+use crate::{components::{overlay_meta, BubbleKind, FileCard, ForwardedBanner, MessageBubble, ReplyQuote}, model::*, ui::Ui, widgets::*};
 #[path = "reactions_ui.rs"]
 pub(crate) mod reactions_ui;
 use adw::prelude::*;
@@ -20,6 +20,13 @@ pub(crate) struct RenderedRows {
     serial: u64,
     rendering: bool,
 }
+/// Three inactive, bounded viewports; detached media stops mapping/playback.
+pub(crate) struct CachedTimeline {
+    rendered: RenderedRows,
+    order: Vec<gtk::ListBoxRow>,
+    messages: Vec<Message>,
+}
+
 struct PreparedMessages {
     messages: Vec<Message>,
     days: Vec<String>,
@@ -34,11 +41,54 @@ struct PreparedMessages {
 struct RenderedRow {
     message: Message,
     row: gtk::ListBoxRow,
-    bubble: gtk::Box,
+    bubble: MessageBubble,
     status: gtk::Box,
     heading: gtk::Box,
+    hats: crate::components::HatStrip,
+    author: gtk::Label,
     avatar: Option<adw::Avatar>,
     reactions: reactions_ui::MessageReactions,
+}
+/// Show an author's hats next to their name. The name stops taking the spare width while hats
+/// are there, so the hats sit beside it instead of at the far edge.
+fn show_hats(strip: &crate::components::HatStrip, author: &gtk::Label, hats: &[crate::rooms::hats::Hat]) {
+    strip.set_hats(hats);
+    author.set_hexpand(hats.is_empty());
+    strip.set_hexpand(!hats.is_empty());
+}
+impl Ui {
+    /// The hats the room gives this message's author, if the room supports them and they are
+    /// in it right now.
+    pub(crate) fn hats_of(&self, m: &Message) -> Vec<crate::rooms::hats::Hat> {
+        if !self.shows_hats() {
+            return Vec::new();
+        }
+        let room = self.state.borrow().current().jid.clone();
+        let rosters = self.room_rosters.borrow();
+        let Some(people) = rosters.get(&room) else {
+            return Vec::new();
+        };
+        people
+            .iter()
+            .find(|person| match (m.sender.is_empty(), person.jid.as_deref()) {
+                // Both addresses are known: they have to be the same person. A nickname alone
+                // proves nothing here, an old message may be from someone who used it before.
+                (false, Some(jid)) => jid == m.sender,
+                _ => crate::text_safety::display_nick(&person.nick, person.own) == m.author,
+            })
+            .map(|person| person.hats.clone())
+            .unwrap_or_default()
+    }
+    /// The room's people changed: update the hats on the messages already on screen.
+    pub(crate) fn refresh_message_hats(&self, room: &str) {
+        if self.state.borrow().current().jid != room {
+            return;
+        }
+        let rendered = self.rendered_rows.borrow();
+        for row in rendered.rows.values() {
+            show_hats(&row.hats, &row.author, &self.hats_of(&row.message));
+        }
+    }
 }
 fn message_focus(root: &gtk::Widget, emoji: Option<&str>) -> Option<gtk::Widget> {
     if let Some(emoji) = emoji {
@@ -130,7 +180,9 @@ fn cluster_style(row: &RenderedRow, previous: bool, next: bool, group: bool) {
         row.row.remove_css_class("cluster-next");
     }
     row.heading
-        .set_visible(group && !row.message.own && !previous || row.message.pinned);
+        .set_visible(group && !row.message.own && !previous
+            && !row.bubble.has_css_class("media-bubble") && !row.bubble.has_css_class("sticker-bubble")
+            || row.message.pinned);
     if let Some(avatar) = row.avatar.as_ref() {
         avatar.set_visible(!next);
     }
@@ -176,9 +228,23 @@ fn action_actor(message: &Message, chat: &Chat, owner: &str) -> String {
     };
     actor.replace(['\n', '\r'], " ")
 }
+/// The ordinary lock of an encrypted message that was sent without some room members, in the
+/// theme's accent colour (blue by default) so it stands out.
+fn partial_lock(m: &Message) -> gtk::Image {
+    let lock = gtk::Image::from_icon_name("channel-secure-symbolic");
+    lock.set_pixel_size(11);
+    lock.add_css_class("message-partial-lock");
+    lock.add_css_class("accent");
+    let tooltip = format!("{} with problems. See Message Details", m.mode().name());
+    lock.set_tooltip_text(Some(&tooltip));
+    lock.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
+    lock
+}
 fn message_status(meta: &gtk::Box, m: &Message) {
     clear(meta);
-    if m.encrypted
+    if m.own && m.encrypted && !m.skipped_members.is_empty() {
+        meta.append(&partial_lock(m));
+    } else if m.encrypted
         && (!m.own
             || !matches!(
                 m.delivery.as_str(),
@@ -217,10 +283,12 @@ fn message_status(meta: &gtk::Box, m: &Message) {
             "failed" | "uncertain" => {
                 let image = gtk::Image::from_icon_name("dialog-warning-symbolic");
                 image.set_pixel_size(12);
-                image.set_tooltip_text(Some(if m.delivery == "failed" {
-                    "Send failed"
-                } else {
-                    "Delivery uncertain"
+                let see_details = !m.failure_reason.is_empty();
+                image.set_tooltip_text(Some(match (m.delivery == "failed", see_details) {
+                    (true, true) => "Send failed. See Message Details",
+                    (true, false) => "Send failed",
+                    (false, true) => "Delivery uncertain. See Message Details",
+                    (false, false) => "Delivery uncertain",
                 }));
                 meta.append(&image);
             }
@@ -303,6 +371,8 @@ impl Ui {
             || row.message.edited != message.edited
             || row.message.encrypted != message.encrypted
             || row.message.encryption_mode != message.encryption_mode
+            || row.message.skipped_members != message.skipped_members
+            || row.message.failure_reason != message.failure_reason
         {
             message_status(&row.status, message);
         }
@@ -404,6 +474,55 @@ impl Ui {
             self.rendered_rows.borrow_mut().rows.remove(&id);
         }
         self.render_messages(false);
+    }
+
+    pub(crate) fn switch_cached_timeline(self: &Rc<Self>, id: &str, newest: bool) {
+        let state = self.state.borrow();
+        let scope = (state.account.clone(), state.chats.iter().find(|chat| chat.id == id).unwrap().jid.clone());
+        let mut cache = self.recent_timelines.borrow_mut();
+        cache.retain(|view| view.rendered.scope.0 == scope.0);
+        let next = cache.iter().position(|view| view.rendered.scope == scope).and_then(|index| cache.remove(index));
+        let serial = self.rendered_rows.borrow().serial.wrapping_add(1);
+        let previous = std::mem::take(&mut *self.rendered_rows.borrow_mut());
+        let mut order = Vec::new();
+        while let Some(child) = self.timeline.first_child() {
+            self.timeline.remove(&child);
+            if let Ok(row) = child.downcast::<gtk::ListBoxRow>() { order.push(row); }
+        }
+        if previous.scope == (state.account.clone(), state.current().jid.clone())
+            && previous.scope != scope && !previous.rendering && !previous.rows.is_empty()
+            && previous.rows.len() <= crate::history_window::PAGE as usize * 2
+            && newest && state.current().messages.len() <= crate::history_window::PAGE as usize * 2
+        {
+            cache.push_front(CachedTimeline { rendered: previous, order, messages: state.current().messages.clone() });
+            cache.truncate(3);
+        }
+        drop(state);
+        self.bubbles.borrow_mut().clear();
+        if let Some(mut view) = next {
+            view.rendered.serial = serial;
+            view.rendered.render_request = None;
+            for row in &view.order { self.timeline.append(row); }
+            for (id, row) in &view.rendered.rows {
+                self.bubbles.borrow_mut().insert(id.clone(), row.bubble.clone().upcast());
+            }
+            let mut state = self.state.borrow_mut();
+            let chat = state.chats.iter_mut().find(|chat| chat.id == id).unwrap();
+            // Keep newer updates received while this viewport was inactive.
+            for message in std::mem::take(&mut chat.messages) {
+                if let Some(old) = view.messages.iter_mut().find(|old| old.id == message.id) { *old = message; }
+                else { view.messages.push(message); }
+            }
+            view.messages.sort_by(|a, b| a.order_key().cmp(&b.order_key()));
+            chat.messages = view.messages;
+            self.rendered_rows.replace(view.rendered);
+            self.timeline.set_opacity(1.);
+            self.queue_message_scroll(ScrollTarget::Bottom);
+        } else {
+            self.rendered_rows.borrow_mut().serial = serial;
+            // Allocate in frame-sized batches, but expose only the final positioned viewport.
+            self.timeline.set_opacity(0.);
+        }
     }
 
     pub fn render_messages(self: &Rc<Self>, bottom: bool) {
@@ -521,6 +640,10 @@ impl Ui {
         let messages = &planned.messages;
         let group = planned.group;
         let scope = planned.scope.clone();
+        if self.rendered_rows.borrow().scope != scope {
+            self.timeline.set_opacity(0.);
+            self.recent_timelines.borrow_mut().retain(|view| view.rendered.scope.0 == scope.0);
+        }
         self.bubbles.borrow_mut().clear();
         let mut rendered = self.rendered_rows.borrow_mut();
         let big_emoji = self.big_emoji.get();
@@ -628,85 +751,82 @@ impl Ui {
                 let slot = bx(false, 0);
                 slot.set_width_request(26);
                 slot.set_valign(gtk::Align::End);
-                slot.append(&a);
+                slot.append(&self.profile_button(&a,&m.sender,&m.author));
                 outer.append(&slot);
                 avatar = Some(a);
             }
-            let sticker = m.attachment.as_ref().is_some_and(|file| file.sticker);
+            let sticker = m.attachment.as_ref().is_some_and(|file| file.sticker)||m.upload.as_ref().is_some_and(|draft|draft.sticker);
             let media = m
                 .attachment
                 .as_ref()
-                .is_some_and(|file| file.media_candidate());
-            let bubble = bx(true, 0);
-            bubble.set_vexpand(false);
-            bubble.set_valign(gtk::Align::Start);
-            if action.is_some() {
-                bubble.add_css_class("date-pill");
-                bubble.add_css_class("action-pill");
-                bubble.set_halign(gtk::Align::Center);
-            } else {
-                bubble.add_css_class("message-bubble");
-            }
-            if self
-                .history_window
-                .highlighted
-                .borrow()
-                .as_ref()
-                .is_some_and(|(id, _)| id == &m.id)
-            {
-                bubble.add_css_class("reply-target");
-            }
-            if planned.emoji_only[index] {
-                bubble.add_css_class("emoji-only");
-            }
-            if m.own && action.is_none() {
-                bubble.add_css_class("own")
-            }
-            if sticker {
-                bubble.add_css_class("sticker-bubble");
+                .is_some_and(|file| file.media_candidate()) || crate::upload_ui::pending_media(&m).is_some();
+            let bubble = MessageBubble::new(if action.is_some() {
+                BubbleKind::Action
+            } else if sticker {
+                BubbleKind::Sticker
             } else if media {
-                bubble.add_css_class("media-bubble");
-            }
-            if m.attachment.is_some() && !media { bubble.add_css_class("document-bubble"); }
+                BubbleKind::Media
+            } else {
+                BubbleKind::Text
+            });
+            bubble.set_own(m.own);
+            bubble.set_emoji_only(planned.emoji_only[index]);
+            bubble.set_document(m.attachment.is_some() && !media);
+            bubble.set_highlighted(
+                self.history_window
+                    .highlighted
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &m.id),
+            );
             let heading = bx(false, 6);
             heading.set_margin_bottom(6);
             let author = text(&m.author, "message-author");
+            author.set_visible(!media && !sticker);
             author.set_hexpand(true);
             author.set_valign(gtk::Align::Center);
             author.set_ellipsize(gtk::pango::EllipsizeMode::End);
             if m.pinned {
                 heading.append(&gtk::Image::from_icon_name("view-pin-symbolic"))
             }
-            heading.append(&author);
+            if !m.sender.is_empty() {
+                let profile = self.profile_button(&author, &m.sender, &m.author);
+                profile.add_css_class("message-author-target");
+                let name = author.downgrade();
+                profile.connect_state_flags_changed(move |button, _| {
+                    if let Some(name) = name.upgrade() {
+                        let attrs = name.attributes().and_then(|attrs| attrs.copy()).unwrap_or_default();
+                        let underline = if button.state_flags().intersects(gtk::StateFlags::PRELIGHT | gtk::StateFlags::FOCUS_VISIBLE) {
+                            gtk::pango::Underline::Single
+                        } else { gtk::pango::Underline::None };
+                        attrs.change(gtk::pango::AttrInt::new_underline(underline));
+                        name.set_attributes(Some(&attrs));
+                    }
+                });
+                heading.append(&profile);
+            } else {
+                heading.append(&author);
+            }
+            let hats = crate::components::HatStrip::new();
+            hats.set_halign(gtk::Align::Start);
+            hats.set_valign(gtk::Align::Center);
+            heading.append(&hats);
+            show_hats(&hats, &author, &self.hats_of(m));
             let meta = bx(false, 4);
             meta.add_css_class("message-meta");
             meta.set_valign(gtk::Align::Center);
             message_status(&meta, m);
             bubble.append(&heading);
             if let Some(attribution) = m.forwarded.clone() {
-                let header = gtk::Button::new();
-                header.add_css_class("flat");
-                header.set_halign(gtk::Align::Start);
-                header.set_margin_bottom(4);
-                let title = text(&format!("Forwarded from {}", attribution.name), "caption");
-                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                title.set_max_width_chars(36);
-                title.set_single_line_mode(true);
-                header.set_child(Some(&title));
-                header.set_tooltip_text(Some(&attribution.name));
                 let weak = Rc::downgrade(self);
-                header.connect_clicked(move |_| {
+                let name = attribution.name.clone();
+                bubble.append(&ForwardedBanner::new(&name, move || {
                     if let Some(ui) = weak.upgrade() {
                         ui.forwarded_details(&attribution);
                     }
-                });
-                bubble.append(&header);
+                }));
             }
             if !m.reply.is_empty() || !m.reply_id.is_empty() {
-                let reply = gtk::Button::new();
-                reply.add_css_class("message-reply");
-                let contents = bx(true, 2);
-                contents.set_hexpand(true);
                 let (reply_author, quote) = m.reply.split_once(" · ").unwrap_or((
                     if m.reply_to == self.state.borrow().account {
                         "You"
@@ -715,20 +835,9 @@ impl Ui {
                     },
                     &m.reply,
                 ));
-                let title = text(reply_author, "reply-author");
-                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                let preview = quote
-                    .lines()
-                    .map(|line| line.strip_prefix("> ").unwrap_or(line))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let snippet = crate::reply_preview_ui::Snippet::new(if preview.is_empty(){"Original message"}else{&preview});
-                contents.append(&title);
-                contents.append(&snippet);
-                let preview_row = bx(false, 7);
-                crate::reply_preview_ui::attach(self, m, &preview_row);
-                preview_row.append(&contents);
-                reply.set_child(Some(&preview_row));
+                let reply = ReplyQuote::new(reply_author, quote);
+                // Measure the quote at the width left by its thumbnail.
+                crate::reply_preview_ui::attach(self, m, reply.grid());
                 let weak = Rc::downgrade(self);
                 let target = m.reply_id.clone();
                 let author = m.reply_to.clone();
@@ -842,6 +951,15 @@ impl Ui {
                     l.set_margin_top(6);
                     bubble.append(&l)
                 }
+                "file" if m.upload.is_some() && media => {
+                    let content=self.media_upload_content(&m);
+                    if sticker || m.text.is_empty() {
+                        bubble.append(&overlay_meta(&content, &meta));
+                    } else {
+                        bubble.append(&content);
+                        bubble.append(&MessageText::new(&wrap(&m.text,"message-text"),&meta));
+                    }
+                }
                 "file" if m.upload.is_some() => {
                     bubble.append(&self.upload_content(&m));
                     if !m.text.is_empty() {
@@ -851,14 +969,7 @@ impl Ui {
                 "file" if m.attachment.is_some() => {
                     let (attachment,spoiler_button) = crate::formatting_ui::hidden_media(&self.attachment_content(&m),crate::formatting_ui::model(&m).spoiler);
                     if sticker || media && m.text.is_empty() {
-                        let overlay = gtk::Overlay::new();
-                        overlay.set_child(Some(&attachment));
-                        meta.add_css_class("sticker-meta");
-                        meta.set_halign(gtk::Align::End);
-                        meta.set_valign(gtk::Align::End);
-                        meta.set_can_target(false);
-                        overlay.add_overlay(&meta);
-                        bubble.append(&overlay);
+                        bubble.append(&overlay_meta(&attachment, &meta));
                     } else {
                         bubble.append(&attachment);
                     }
@@ -885,17 +996,11 @@ impl Ui {
                     }
                 }
                 "file" => {
-                    let file = bx(false, 10);
-                    let image = gtk::Image::from_icon_name("application-pdf-symbolic");
-                    image.set_pixel_size(32);
-                    file.append(&image);
-                    let words = bx(true, 2);
-                    words.append(&wrap(
+                    let file = FileCard::new(
+                        "application-pdf-symbolic",
                         if m.own { &m.text } else { "Desktop notes.pdf" },
-                        "heading",
-                    ));
-                    words.append(&text("Local file preview", "caption dim-label"));
-                    file.append(&words);
+                        "Local file preview",
+                    );
                     bubble.append(&file);
                     if !m.own {
                         bubble.append(&wrap(&m.text, ""))
@@ -930,7 +1035,12 @@ impl Ui {
                         && planned.emoji_only[index]
                         && m.text.chars().count() < 5
                     {
-                        "large-emoji"
+                        // Exactly one emoji is drawn at the size of its animation, bundled or not.
+                        if crate::emoji_completion::catalog_entry(m.text.trim()).is_some() {
+                            "single-emoji"
+                        } else {
+                            "large-emoji"
+                        }
                     } else {
                         "message-text"
                     };
@@ -939,13 +1049,29 @@ impl Ui {
                         bubble.append(&crate::formatting_ui::article_widget(&document,&meta));
                     } else {
                         let preview=self.link_preview_for_message(&m);
+                        // Exactly one bundled emoji and nothing else: play its Noto animation.
+                        // Anything else (more emoji, text, links, formatting, custom emoji,
+                        // emoji outside the packs) keeps the ordinary rendering below.
+                        let animation=(css=="single-emoji"
+                            && preview.is_none()
+                            && m.inline_emoji.is_none()
+                            // Sent messages always carry a formatting record; only styled text opts out.
+                            && m.formatting.as_ref().is_none_or(|markup|markup.ranges.is_empty())
+                            && display.removed.is_empty())
+                            .then(||crate::noto_emoji::animation_for(&display.body))
+                            .flatten();
+                        if let Some(animation)=animation {
+                            bubble.append(&crate::animated_emoji_ui::widget(display.body.trim(),animation));
+                        } else {
                         let links=crate::link_previews::clickable_urls(&display.body,None);
                         let inline=m.inline_emoji.as_ref().and_then(|emoji|emoji.without(&display.removed).ok()).filter(|emoji|emoji.body==display.body).map(|emoji|self.inline_message_text_formatted(&display.body,&emoji,preview.is_none().then_some(&meta),&links,Some(&rich)));
                         let l=wrap(&display.body,css);
+                        l.set_max_width_chars(-1);
                         if let Some(preview)=preview {
                             if let Some(inline)=inline.as_ref(){bubble.append(inline);}else{crate::formatting_ui::FormattedLabel::new(&l,rich.clone());bubble.append(&l);}
                             bubble.append(&crate::link_preview_ui::link_preview_card(&preview));
                         }else if let Some(inline)=inline{bubble.append(&inline);}else{bubble.append(&MessageText::with_rich(&l,&meta,rich.clone()));}
+                        }
                     }
                 }
                 _ => {}
@@ -955,7 +1081,7 @@ impl Ui {
                 meta.set_margin_top(3);
                 bubble.append(&meta);
             }
-            let reactions = reactions_ui::MessageReactions::new(self, &m, &bubble, media, &meta);
+            let reactions = reactions_ui::MessageReactions::new(self, &m, bubble.as_box(), media, &meta);
             let presentation=self.send_animation.wrap(&m.id,&bubble);
             if action.is_some() {
                 outer.set_halign(gtk::Align::Center);
@@ -987,9 +1113,27 @@ impl Ui {
                 click.set_propagation_phase(gtk::PropagationPhase::Capture);
                 let id = m.id.clone();
                 let weak = Rc::downgrade(self);
-                click.connect_pressed(move |g, _, _, _| {
+                let handled = Cell::new(false);
+                click.connect_pressed(move |g, presses, x, y| {
+                    if presses == 1 { handled.set(false); }
                     if let Some(ui) = weak.upgrade() {
                         let flags = g.current_event_state();
+                        if presses>=2 && !flags.intersects(gdk::ModifierType::CONTROL_MASK|gdk::ModifierType::SHIFT_MASK|gdk::ModifierType::ALT_MASK) {
+                            let interactive=g.widget().and_then(|row|row.pick(x,y,gtk::PickFlags::DEFAULT)).is_some_and(|mut widget|{loop{if widget.is::<gtk::Button>()||widget.is::<gtk::TextView>()||widget.is::<gtk::Scale>(){return true;}let Some(parent)=widget.parent()else{return false;};if parent.has_css_class("message-row"){return false;}widget=parent;}});
+                            if !interactive {
+                                // GTK keeps counting beyond two; do not hand later clicks to text selection.
+                                if handled.get() {
+                                    g.set_state(gtk::EventSequenceState::Claimed);
+                                    if presses % 2 == 0 { ui.double_click_message(&id); }
+                                    return;
+                                }
+                                if presses % 2 == 0 && ui.double_click_message(&id) {
+                                    handled.set(true);
+                                    g.set_state(gtk::EventSequenceState::Claimed);
+                                    return;
+                                }
+                            }
+                        }
                         if flags.intersects(
                             gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
                         ) || !ui.selected.borrow().is_empty()
@@ -1006,7 +1150,7 @@ impl Ui {
             right.set_propagation_phase(gtk::PropagationPhase::Capture);
             let id = m.id.clone();
             let weak = Rc::downgrade(self);
-            let parent = bubble.downgrade();
+            let parent = bubble.as_box().downgrade();
             right.connect_pressed(move |g, _, x, y| {
                 g.set_state(gtk::EventSequenceState::Claimed);
                 if let (Some(ui), Some(parent)) = (weak.upgrade(), parent.upgrade()) {
@@ -1020,6 +1164,8 @@ impl Ui {
                 bubble,
                 status: meta,
                 heading,
+                hats,
+                author,
                 avatar,
                 reactions,
             };
@@ -1086,6 +1232,9 @@ impl Ui {
         }
     }
     fn capture_scroll_position(&self) -> ScrollTarget {
+        self.capture_scroll_position_excluding(&[])
+    }
+    fn capture_scroll_position_excluding(&self, removed: &[String]) -> ScrollTarget {
         let value = self.scroll.vadjustment().value();
         let mut row = self
             .timeline
@@ -1094,7 +1243,8 @@ impl Ui {
         let mut anchor = None;
         while let Some(widget) = row {
             let id = widget.widget_name();
-            if let Some(bubble) = self.bubbles.borrow().get(id.as_str()) {
+            if !removed.iter().any(|removed| removed == id.as_str())
+                && let Some(bubble) = self.bubbles.borrow().get(id.as_str()) {
                 if let Some(bounds) = bubble.compute_bounds(&self.timeline) {
                     anchor = Some((id.to_string(), f64::from(bounds.y()) - value));
                     break;
@@ -1108,6 +1258,10 @@ impl Ui {
         let adjustment = self.scroll.vadjustment();
         (self.state.borrow().account.is_empty() || self.history_window.newest())
             && adjustment.upper() - adjustment.page_size() - adjustment.value() < 24.
+    }
+    pub(crate) fn deletion_scroll_target(&self, removed: &[String]) -> ScrollTarget {
+        if self.at_message_end() { ScrollTarget::Bottom }
+        else { self.capture_scroll_position_excluding(removed) }
     }
     pub fn queue_message_scroll(self: &Rc<Self>, target: ScrollTarget) {
         let pending = self.message_scroll.borrow().is_some();
@@ -1132,6 +1286,7 @@ impl Ui {
                         ui.cancel_reply_scroll();
                         ui.history_window.moving.set(true);
                         if let ScrollTarget::Message(id)=target {
+                            if !ui.rendering_messages() && !ui.history_window.busy() { ui.timeline.set_opacity(1.); }
                             if let Some(value)=ui.highlight_position(id){ui.animate_reply_scroll(value);}
                             return None;
                         }
@@ -1155,6 +1310,7 @@ impl Ui {
                         });
                         ui.history_window.moving.set(false);
                     }
+                    if !ui.rendering_messages() && !ui.history_window.busy() { ui.timeline.set_opacity(1.); }
                     ui.schedule_history_maintenance();
                 }
                 None
@@ -1288,7 +1444,6 @@ impl Ui {
     pub fn delete_confirmation(self: &Rc<Self>, ids: Vec<String>) {
         let owner = self.state.borrow().account.clone();
         let chat = self.state.borrow().active.clone();
-        self.notice("Preparing message deletion…");
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let Some(ui) = weak.upgrade() else {
@@ -1367,6 +1522,7 @@ impl Ui {
         });
     }
     pub fn delete_messages(self: &Rc<Self>, ids: &[String]) {
+        let position = self.deletion_scroll_target(ids);
         let mut s = self.state.borrow_mut();
         let peer = s.current().jid.clone();
         let Ok(ids) = self.store.deletion_targets(&s.account, &peer, ids) else {
@@ -1383,6 +1539,10 @@ impl Ui {
                     return;
                 }
                 self.uploads.borrow_mut().cancel(id);
+                // Deleting a picture that was still waiting to upload also deletes its edited copy.
+                if let Some(draft) = message.as_ref().and_then(|m| m.upload.as_ref()) {
+                    crate::picture_editor_ui::discard_edited_uri(&draft.uri);
+                }
                 if message.as_ref().is_some_and(|m| m.upload.is_some()) {
                     let (account, id) = (s.account.clone(), id.clone());
                     gtk::gio::spawn_blocking(move || {
@@ -1413,7 +1573,7 @@ impl Ui {
         }
         self.clear_selection();
         self.persist();
-        self.render_messages(false);
+        self.render_messages_at(position);
         self.refresh_chats(None);
     }
     pub fn react(self: &Rc<Self>, id: &str, emoji: &str) {
@@ -1690,7 +1850,7 @@ impl Ui {
         else {
             return;
         };
-        clear(&bubble);
+        clear(&bubble);bubble.add_css_class("message-editing");bubble.remove_css_class("emoji-only");
         let editor = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
             .build();
@@ -1714,12 +1874,14 @@ impl Ui {
         let actions = bx(false, 6);
         actions.set_halign(gtk::Align::End);
         let cancel = gtk::Button::with_label("Cancel");
-        self.weak_button(&cancel, |s| s.render_messages(false));
+        let weak=Rc::downgrade(self);let cancel_id=id.to_string();
+        cancel.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.rendered_rows.borrow_mut().rows.remove(&cancel_id);ui.render_messages(false);}});
         actions.append(&cancel);
         let save = gtk::Button::with_label("Save");
         save.add_css_class("suggested-action");
         let weak = Rc::downgrade(self);
         let id = id.to_string();
+        let edit_view=editor.clone();
         save.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 if ui.generation.get() != generation
@@ -1728,7 +1890,7 @@ impl Ui {
                 {
                     return;
                 }
-                let b = editor.buffer();
+                let b = edit_view.buffer();
                 let value = b.text(&b.start_iter(), &b.end_iter(), true);
                 if value.trim().is_empty() {
                     return;
@@ -1741,7 +1903,7 @@ impl Ui {
                     let Some(target) = crate::message_actions::original_wire(&m) else {
                         return;
                     };
-                    let mut formatting=crate::formatting_ui::editor_formatting(&editor,&edit_spoiler);
+                    let mut formatting=crate::formatting_ui::editor_formatting(&edit_view,&edit_spoiler);
                     formatting.markdown=original.markdown;
                     if formatting.markdown{formatting.unstyled=true;}
                     ui.send_formatted_action(&id,crate::message_actions::Action::Correct { target },formatting.styled());
@@ -1755,7 +1917,7 @@ impl Ui {
                     .iter_mut()
                     .find(|m| m.id == id)
                 {
-                    let formatting=crate::formatting_ui::editor_formatting(&editor,&edit_spoiler).styled();
+                    let formatting=crate::formatting_ui::editor_formatting(&edit_view,&edit_spoiler).styled();
                     m.text = formatting.body.clone();m.preview_spoilers=Some(formatting.spoiler_context());m.formatting=Some(formatting);
                 }
                 ui.render_messages(false);
@@ -1764,6 +1926,18 @@ impl Ui {
         });
         actions.append(&save);
         bubble.append(&actions);
+        let completion=crate::emoji_completion::attach_for_chat(&editor,self);
+        let keys=gtk::EventControllerKey::new();keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let confirm=save.downgrade();let dismiss=cancel.downgrade();
+        keys.connect_key_pressed(move|_,key,_,modifiers|{
+            if matches!(key,gdk::Key::Return|gdk::Key::KP_Enter)&&!modifiers.contains(gdk::ModifierType::SHIFT_MASK){
+                if let Some(save)=confirm.upgrade(){save.emit_clicked();}return glib::Propagation::Stop;
+            }
+            if completion.key(key,modifiers){return glib::Propagation::Stop;}
+            if key==gdk::Key::Escape {if let Some(cancel)=dismiss.upgrade(){cancel.emit_clicked();}return glib::Propagation::Stop;}
+            glib::Propagation::Proceed
+        });editor.add_controller(keys);
+        let b=editor.buffer();b.place_cursor(&b.end_iter());editor.grab_focus();bubble.queue_resize();
     }
 }
 
@@ -1830,3 +2004,201 @@ mod reaction_scroll_native;
 #[cfg(test)]
 #[path = "../tests/reaction_media_native.rs"]
 mod reaction_media_native;
+
+#[cfg(test)]
+mod editor_native_tests {
+    use super::*;
+    fn wait(mut ready:impl FnMut()->bool) {
+        let context=glib::MainContext::default();let end=std::time::Instant::now()+Duration::from_secs(6);
+        while std::time::Instant::now()<end {for _ in 0..50{if !context.pending(){break;}context.iteration(false);}if ready(){return;}std::thread::sleep(Duration::from_millis(3));}assert!(ready(),"Editor did not settle");
+    }
+    fn text_view(widget:&gtk::Widget)->Option<gtk::TextView>{if let Some(view)=widget.downcast_ref::<gtk::TextView>(){return Some(view.clone());}let mut child=widget.first_child();while let Some(current)=child{child=current.next_sibling();if let Some(view)=text_view(&current){return Some(view);}}None}
+    fn key(widget:&impl IsA<gtk::Widget>,value:&str){
+        assert!(widget.grab_focus());let output=std::process::Command::new("xdotool").args(["search","--onlyvisible","--pid",&std::process::id().to_string(),"--name","Monogram"]).output().unwrap();let id=String::from_utf8(output.stdout).unwrap().lines().next().unwrap().to_owned();let value=value.to_owned();let task=std::thread::spawn(move||assert!(std::process::Command::new("xdotool").args(["key","--window",&id,&value]).status().unwrap().success()));wait(||task.is_finished());task.join().unwrap();
+    }
+    #[test]
+    #[ignore="requires isolated native display, xdotool and Secret Service"]
+    fn editing_uses_composer_completion_and_native_keyboard_rules(){
+        let app=adw::Application::builder().application_id("com.negzero.MonogramDesktop.EditFixture").flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let ui=Ui::new(&app,true);ui.window.set_default_size(1200,800);ui.window.present();
+        {let mut state=ui.state.borrow_mut();state.account.clear();state.current_mut().messages=vec![Message{id:"own-edit-fixture".into(),text:"Original".into(),own:true,kind:"text".into(),time:"12:00".into(),..Default::default()},Message{id:"incoming-edit-fixture".into(),text:"Incoming".into(),kind:"text".into(),time:"12:01".into(),..Default::default()}];}
+        ui.composer.buffer().set_text("");ui.render_messages(true);wait(||ui.bubbles.borrow().contains_key("own-edit-fixture"));
+        key(&ui.composer,"Up");wait(||ui.bubbles.borrow().get("own-edit-fixture").and_then(text_view).is_some());
+        let bubble=ui.bubbles.borrow()["own-edit-fixture"].clone();let editor=text_view(&bubble).unwrap();wait(||editor.width()>100);
+        let limit=bubble.parent().unwrap();assert!(bubble.width()>limit.width()*2/5-32,"Editing bubble did not use maximum width: {}/{}",bubble.width(),limit.width());
+        let buffer=editor.buffer();buffer.set_text(":sku");buffer.place_cursor(&buffer.end_iter());
+        wait(||{let mut child=editor.first_child();while let Some(current)=child{child=current.next_sibling();if current.is::<gtk::Popover>()&&current.is_mapped(){return true;}}false});
+        key(&editor,"Tab");wait(||!buffer.text(&buffer.start_iter(),&buffer.end_iter(),true).starts_with(':'));
+        buffer.set_text("Edited");buffer.place_cursor(&buffer.end_iter());key(&editor,"shift+Return");wait(||buffer.text(&buffer.start_iter(),&buffer.end_iter(),true).ends_with('\n'));
+        key(&editor,"Return");wait(||ui.state.borrow().message("own-edit-fixture").is_some_and(|m|m.text=="Edited\n"));wait(||ui.bubbles.borrow().get("own-edit-fixture").and_then(text_view).is_none());
+        key(&ui.composer,"Up");wait(||ui.bubbles.borrow().get("own-edit-fixture").and_then(text_view).is_some());
+        let editor=text_view(&ui.bubbles.borrow()["own-edit-fixture"]).unwrap();key(&editor,"Escape");wait(||ui.bubbles.borrow().get("own-edit-fixture").and_then(text_view).is_none());ui.window.close();
+    }
+}
+
+#[cfg(test)]
+mod chat_switch_tests {
+    use super::*;
+    use gtk::gio;
+    fn pump() {
+        let context=glib::MainContext::default();
+        for _ in 0..30 {if !context.pending(){break;}context.iteration(false);}
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    fn settled(ui:&Rc<Ui>) -> bool {
+        !ui.rendering_messages() && !ui.history_window.busy() && ui.message_scroll.borrow().is_none() && ui.timeline.opacity()>0.99 && ui.at_message_end()
+    }
+    fn wait(ui:&Rc<Ui>) {
+        let start=std::time::Instant::now();
+        while start.elapsed()<Duration::from_secs(8) {pump();if settled(ui){return;}}
+        panic!("chat did not settle");
+    }
+    #[test]
+    #[ignore="requires a private GTK display and D-Bus"]
+    fn switching_chats_reuses_bounded_views_and_never_exposes_partial_cold_rows() {
+        let application=adw::Application::builder().application_id("com.negzero.MonogramDesktop.ChatCacheFixture").flags(gio::ApplicationFlags::NON_UNIQUE).build();application.register(None::<&gio::Cancellable>).unwrap();
+        let ui=Ui::new(&application,true);
+        let owner="owner@fixture.invalid";
+        ui.store.save_account(&Account{jid:owner.into(),host:String::new(),port:5222,direct_tls:false}).unwrap();
+        let mut fixture=State::live(owner,vec![]);
+        for n in 0..6 {
+            let peer=format!("chat{n}@fixture.invalid");let chat=fixture.chat_for(&peer);
+            for i in 0..36 {
+                chat.messages.push(Message{id:format!("{n}-{i:02}"),wire_id:format!("{n}-{i:02}"),sender:peer.clone(),text:format!("Message {i}\nAnother line of content\nThird line of content"),timestamp:format!("2026-11-20T12:{i:02}:00Z"),..Default::default()});
+            }
+        }
+        fixture.active=fixture.chats[0].id.clone();ui.store.save(&fixture).unwrap();ui.activate_state(ui.store.load_windowed(owner));ui.window.set_default_size(900,520);ui.window.present();wait(&ui);
+        let start=std::time::Instant::now();ui.select_chat("chat1@fixture.invalid");
+        let mut visible_partial=0;let mut first_feedback=None;
+        while start.elapsed()<Duration::from_secs(8) {
+            pump();
+            if ui.history.is_visible()||ui.timeline.opacity()>0.99 {first_feedback.get_or_insert(start.elapsed());}
+            if ui.timeline.opacity()>0.99 && ui.rendering_messages() {visible_partial+=1;}
+            if settled(&ui){break;}
+        }
+        assert!(settled(&ui));
+        eprintln!("Cold switch: {:?}, first feedback={:?}, partial viewport observations={visible_partial}",start.elapsed(),first_feedback);
+        assert!(first_feedback.unwrap()<Duration::from_millis(400));
+        if std::env::var_os("MONOGRAM_CACHE_BASELINE").is_none() {assert_eq!(visible_partial,0);}
+        let original=ui.rendered_rows.borrow().rows["1-35"].row.clone();
+        ui.select_chat("chat2@fixture.invalid");wait(&ui);
+        let start=std::time::Instant::now();ui.select_chat("chat1@fixture.invalid");
+        let immediate=ui.timeline.last_child().is_some();wait(&ui);
+        let reused=ui.rendered_rows.borrow().rows["1-35"].row==original;
+        eprintln!("Warm switch: {:?}, immediately attached={immediate}, reused same widget={reused}",start.elapsed());
+        if std::env::var_os("MONOGRAM_CACHE_BASELINE").is_none() {assert!(immediate&&reused);assert!(start.elapsed()<Duration::from_millis(400));}
+        for n in 2..6 {ui.select_chat(&format!("chat{n}@fixture.invalid"));wait(&ui);}
+        assert!(ui.recent_timelines.borrow().len()<=3);
+        assert!(ui.recent_timelines.borrow().iter().all(|view|view.rendered.rows.len()<=72));
+        ui.select_chat("chat1@fixture.invalid");wait(&ui);
+        eprintln!("Evicted viewport rebuilt correctly");
+        assert!(ui.bubbles.borrow().contains_key("1-35"));
+        let mut other=State::live("another@fixture.invalid",vec![]);
+        other.active=other.chat_for("chat1@fixture.invalid").id.clone();
+        ui.activate_state(other);
+        assert!(ui.recent_timelines.borrow().is_empty());
+        assert!(ui.timeline.first_child().is_none());
+        wait(&ui);
+        assert!(!ui.bubbles.borrow().contains_key("1-35"));
+        ui.window.close();
+    }
+}
+
+#[cfg(test)]
+mod hats_tests {
+    use super::*;
+    use crate::rooms::{hats::Hat, members::Participant};
+    use gtk::{gio, prelude::*};
+
+    const ROOM: &str = "room@conference.example.org";
+
+    fn ui() -> Rc<Ui> {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.negzero.MessageHatsFixture")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        Ui::new(&app, true)
+    }
+    fn person(nick: &str, jid: Option<&str>, own: bool, hats: Vec<Hat>) -> Participant {
+        Participant {
+            nick: nick.into(),
+            jid: jid.map(Into::into),
+            affiliation: "member".into(),
+            role: "participant".into(),
+            show: String::new(),
+            own,
+            hats,
+        }
+    }
+    fn host() -> Vec<Hat> {
+        vec![Hat::new("Host", "urn:h", Some(120.0)).unwrap()]
+    }
+    fn message(author: &str, sender: &str) -> Message {
+        Message { id: format!("m-{author}"), author: author.into(), sender: sender.into(), text: "hi".into(), ..Default::default() }
+    }
+    fn open_room(ui: &Rc<Ui>) {
+        let mut state = ui.state.borrow_mut();
+        let chat = state.chat_for(ROOM);
+        chat.group = true;
+        let id = chat.id.clone();
+        state.active = id;
+    }
+
+    #[gtk::test]
+    #[ignore = "requires a private GTK display and D-Bus"]
+    fn an_authors_hats_are_found_by_address_then_by_cleaned_nickname() {
+        let ui = ui();
+        open_room(&ui);
+        ui.room_rosters.borrow_mut().insert(
+            ROOM.into(),
+            vec![
+                person("amy", Some("amy@example.org"), false, host()),
+                person("bob", None, false, vec![]),
+                person("me", None, true, host()),
+                person("evil\u{202e}", None, false, host()),
+            ],
+        );
+        let titles = |m: Message| ui.hats_of(&m).into_iter().map(|h| h.title).collect::<Vec<_>>();
+        assert_eq!(titles(message("amy", "amy@example.org")), ["Host"], "by real address");
+        assert_eq!(titles(message("Someone Else", "amy@example.org")), ["Host"], "even under another display name");
+        assert_eq!(titles(message("amy", "")), ["Host"], "by nickname when no address is known");
+        assert!(titles(message("bob", "")).is_empty(), "no hats, none shown");
+        assert_eq!(titles(message("me", "")), ["Host"], "your own hats too");
+        assert_eq!(titles(message("evil", "")), ["Host"], "compared after the same cleaning the list uses");
+        assert!(titles(message("nobody", "")).is_empty(), "someone who left shows none");
+        assert!(
+            titles(message("amy", "amy@elsewhere.org")).is_empty(),
+            "the same nickname from a different address is a different person"
+        );
+        assert_eq!(titles(message("bob", "bob@example.org")), Vec::<String>::new(), "known address, roster has none");
+    }
+
+    #[gtk::test]
+    #[ignore = "requires a private GTK display and D-Bus"]
+    fn without_a_roster_or_in_another_chat_no_hats_are_shown() {
+        let ui = ui();
+        open_room(&ui);
+        assert!(ui.hats_of(&message("amy", "")).is_empty(), "no roster yet");
+        ui.room_rosters.borrow_mut().insert("other@conference.example.org".into(), vec![person("amy", None, false, host())]);
+        assert!(ui.hats_of(&message("amy", "")).is_empty(), "another room's hats do not leak in");
+        ui.room_rosters.borrow_mut().insert(ROOM.into(), vec![]);
+        assert!(ui.hats_of(&message("amy", "")).is_empty(), "an empty roster");
+    }
+
+    #[gtk::test]
+    #[ignore = "requires a private GTK display and D-Bus"]
+    fn the_author_name_gives_up_spare_width_only_while_hats_are_shown() {
+        adw::init().unwrap();
+        let strip = crate::components::HatStrip::new();
+        let author = gtk::Label::new(Some("amy"));
+        show_hats(&strip, &author, &[]);
+        assert!(author.hexpands() && !strip.hexpands() && !strip.is_visible(), "unchanged without hats");
+        show_hats(&strip, &author, &host());
+        assert!(!author.hexpands() && strip.hexpands() && strip.is_visible());
+        assert_eq!(strip.chips().len(), 1);
+        show_hats(&strip, &author, &[]);
+        assert!(author.hexpands() && !strip.hexpands() && !strip.is_visible(), "and back again");
+    }
+}

@@ -43,15 +43,51 @@ pub struct RoomSender {
     pub author: String,
 }
 
+/// Only the values XEP-0045 and XEP-0045's presence rules define are kept; anything else (from a
+/// hostile or buggy occupant or service) becomes the default, so a stanza cannot make the roster
+/// store arbitrary text.
+fn known(value: Option<&str>, allowed: &[&str], default: &str) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| allowed.contains(value))
+        .unwrap_or(default)
+        .to_owned()
+}
+const AFFILIATIONS: [&str; 5] = ["owner", "admin", "member", "none", "outcast"];
+const ROLES: [&str; 4] = ["moderator", "participant", "visitor", "none"];
+const SHOWS: [&str; 4] = ["chat", "away", "xa", "dnd"];
+
+/// One room occupant as shown in the participants list. Built from presence only, so it is
+/// available in public rooms too; `jid` is set only when the room discloses real addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Participant {
+    pub nick: String,
+    pub jid: Option<String>,
+    pub affiliation: String,
+    pub role: String,
+    /// XMPP `show` value: empty (available), away, xa or dnd.
+    pub show: String,
+    pub own: bool,
+    /// XEP-0317 hats. Empty unless the room advertises hats support (see [`Registry::set_hats`]).
+    pub hats: Vec<super::hats::Hat>,
+}
+
 #[derive(Default)]
 pub(super) struct Registry {
     serial: u64,
     rooms: BTreeMap<String, Identities>,
+    /// Rooms whose roster was cleared and not yet reported.
+    gone: std::collections::BTreeSet<String>,
+    /// Rooms that advertise XEP-0317. Kept apart from the per-join state so the answer survives
+    /// the roster being reset, whichever of the two arrives first.
+    hats: std::collections::BTreeSet<String>,
 }
 #[derive(Default)]
 struct Identities {
     revision: u64,
     occupants: BTreeMap<String, (Option<String>, String)>,
+    roster: BTreeMap<String, Participant>,
+    roster_dirty: bool,
     invalid: bool,
     pending: Option<u64>,
     attempted: Option<u64>,
@@ -79,6 +115,7 @@ impl Registry {
         Ok(())
     }
     pub fn reset(&mut self, room: &str) {
+        self.gone.insert(room.into());
         self.serial = self.serial.wrapping_add(1);
         self.rooms.insert(
             room.into(),
@@ -89,10 +126,51 @@ impl Registry {
         );
     }
     pub fn remove(&mut self, room: &str) {
-        self.rooms.remove(room);
+        self.hats.remove(room);
+        if self.rooms.remove(room).is_some() {
+            self.gone.insert(room.into());
+        }
     }
     pub fn clear(&mut self) {
-        self.rooms.clear();
+        self.hats.clear();
+        let rooms = std::mem::take(&mut self.rooms);
+        self.gone.extend(rooms.into_keys());
+    }
+    /// The room advertises (or stopped advertising) XEP-0317. Occupants already listed are
+    /// reported again so their hats appear, or disappear, at once.
+    pub fn set_hats(&mut self, room: &str, supported: bool) {
+        let changed =
+            if supported { self.hats.insert(room.into()) } else { self.hats.remove(room) };
+        if changed && let Some(state) = self.rooms.get_mut(room) {
+            state.roster_dirty = true;
+        }
+    }
+    /// Rosters changed since the last call, as complete lists; a cleared room reports an empty one.
+    pub fn take_roster_changes(&mut self) -> Vec<(String, Vec<Participant>)> {
+        let mut changes = Vec::new();
+        for (room, state) in self.rooms.iter_mut().filter(|(_, state)| state.roster_dirty) {
+            state.roster_dirty = false;
+            self.gone.remove(room);
+            let shown = self.hats.contains(room);
+            changes.push((
+                room.clone(),
+                state
+                    .roster
+                    .values()
+                    .cloned()
+                    .map(|mut person| {
+                        if !shown {
+                            person.hats.clear();
+                        }
+                        person
+                    })
+                    .collect(),
+            ));
+        }
+        for room in std::mem::take(&mut self.gone) {
+            changes.push((room, Vec::new()));
+        }
+        changes
     }
     pub fn invalidate(&mut self, room: &str) {
         if let Some(state) = self.rooms.get_mut(room) {
@@ -105,18 +183,51 @@ impl Registry {
         let Some(state) = self.rooms.get_mut(room) else {
             return;
         };
-        let parsed = child(user, "item", "http://jabber.org/protocol/muc#user");
+        let parsed = user_item(user);
         let item = parsed.as_ref().ok().and_then(|item| *item);
         let removed = xml.attr("type") == Some("unavailable");
+        if let Some(item) = item {
+            let nick = address
+                .split_once('/')
+                .map_or("", |(_, nick)| nick)
+                .to_owned();
+            if removed {
+                state.roster_dirty |= state.roster.remove(address).is_some();
+            } else if !nick.is_empty()
+                && (state.roster.len() < MAX_MEMBERS || state.roster.contains_key(address))
+            {
+                let participant = Participant {
+                    nick,
+                    jid: item
+                        .attr("jid")
+                        .and_then(|real| real.parse::<Jid>().ok())
+                        .filter(|jid| jid.node().is_some())
+                        .map(|jid| jid.to_bare().to_string()),
+                    affiliation: known(item.attr("affiliation"), &AFFILIATIONS, "none"),
+                    role: known(item.attr("role"), &ROLES, "participant"),
+                    show: known(
+                        xml.children().find(|child| child.name() == "show").map(|show| show.text()).as_deref(),
+                        &SHOWS,
+                        "",
+                    ),
+                    own: user.children().any(|status| {
+                        status.name() == "status" && status.attr("code") == Some("110")
+                    }),
+                    // Always read, only shown once the room is known to support hats.
+                    hats: super::hats::parse(xml),
+                };
+                if state.roster.get(address) != Some(&participant) {
+                    state.roster.insert(address.into(), participant);
+                    state.roster_dirty = true;
+                }
+            }
+        }
         let author = item.and_then(|item| item.attr("jid")).and_then(|real| {
             let jid = real.parse::<Jid>().ok()?;
             jid.node()?;
             Some(jid.to_bare().to_string())
         });
-        let affiliation = item
-            .and_then(|item| item.attr("affiliation"))
-            .unwrap_or("")
-            .to_owned();
+        let affiliation = known(item.and_then(|item| item.attr("affiliation")), &AFFILIATIONS, "");
         let valid = parsed.is_ok() && item.is_some() && bounded(xml).is_ok();
         let value = (author, affiliation);
         let changed = if !valid
@@ -165,18 +276,20 @@ impl Registry {
             .snapshot
             .as_ref()
             .ok_or(Error::RecipientsUnavailable)?;
-        if state.invalid
-            || !snapshot.affiliations.contains_key(owner)
-            || state.occupants.values().any(|(author, affiliation)| {
-                author.as_ref().is_none_or(|jid| {
-                    snapshot
-                        .affiliations
-                        .get(jid)
-                        .is_none_or(|listed| listed.name() != affiliation)
-                })
-            })
-        {
+        if state.invalid || !snapshot.affiliations.contains_key(owner) {
             return Err(Error::RecipientsUnavailable);
+        }
+        let unlisted = state.occupants.iter().find(|(_, (author, affiliation))| {
+            author.as_ref().is_none_or(|jid| {
+                snapshot
+                    .affiliations
+                    .get(jid)
+                    .is_none_or(|_| !matches!(affiliation.as_str(), "member" | "admin" | "owner"))
+            })
+        });
+        if let Some((address, _)) = unlisted {
+            let nick = address.split_once('/').map_or(address.as_str(), |(_, nick)| nick);
+            return Err(Error::OccupantNotListed(crate::text_safety::display_nick(nick, false)));
         }
         Ok(RoomRecipients {
             room: room.into(),
@@ -217,8 +330,11 @@ fn parse_list(xml: &Element, affiliation: Affiliation) -> Result<BTreeMap<String
     Ok(members)
 }
 
-fn complete(room: &str, info: Element, lists: [Element; 3]) -> Result<MemberSnapshot> {
-    bounded(&info)?;
+/// Only a members-only, non-anonymous room discloses a complete recipient list. Anything else
+/// (a public or semi-anonymous room) can never be end-to-end encrypted, so report that from the
+/// room's features alone, before asking for member lists a public room refuses to give.
+fn require_private(info: &Element) -> Result<()> {
+    bounded(info)?;
     if !info.is("query", DISCO) || info.attr("node").is_some() {
         return Err(Error::Invalid);
     }
@@ -232,8 +348,13 @@ fn complete(room: &str, info: Element, lists: [Element; 3]) -> Result<MemberSnap
         || has("muc_anonymous")
         || has("muc_open")
     {
-        return Err(Error::RecipientsUnavailable);
+        return Err(Error::NotPrivate);
     }
+    Ok(())
+}
+
+fn complete(room: &str, info: Element, lists: [Element; 3]) -> Result<MemberSnapshot> {
+    require_private(&info)?;
     let mut affiliations = BTreeMap::new();
     for (list, affiliation) in
         lists
@@ -261,8 +382,9 @@ pub async fn fetch(iq: &iq::Client, room: &str) -> Result<MemberSnapshot> {
         query.append_child(attr(el("item", ADMIN), "affiliation", affiliation.name()));
         request(iq, &room, query)
     };
-    let (info, member, admin, owner) = tokio::try_join!(
-        request(iq, &room, el("query", DISCO)),
+    let info = request(iq, &room, el("query", DISCO)).await?;
+    require_private(&info)?;
+    let (member, admin, owner) = tokio::try_join!(
         list(Affiliation::Member),
         list(Affiliation::Admin),
         list(Affiliation::Owner),
@@ -273,6 +395,243 @@ pub async fn fetch(iq: &iq::Client, room: &str) -> Result<MemberSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn occupant_presence(room: &str, nick: &str, extra: &str, kind: &str, user: &str) -> (Element, Element) {
+        let xml: Element = format!(
+            "<presence xmlns='jabber:client' from='{room}/{nick}'{kind}>{extra}<x xmlns='http://jabber.org/protocol/muc#user'>{user}</x></presence>"
+        )
+        .parse()
+        .unwrap();
+        let user = xml.get_child("x", "http://jabber.org/protocol/muc#user").unwrap().clone();
+        (xml, user)
+    }
+
+    #[test]
+    fn roster_follows_occupant_presence_and_reports_each_change_once() {
+        let room = "room@conference.example.org";
+        let mut registry = Registry::default();
+        registry.reset(room);
+        registry.take_roster_changes();
+        let item = |affiliation: &str, jid: &str| {
+            format!("<item affiliation='{affiliation}' role='participant'{jid}/>")
+        };
+        let (xml, user) = occupant_presence(room, "amy", "<show>away</show>", "", &item("admin", " jid='amy@example.org/phone'"));
+        registry.presence(room, &format!("{room}/amy"), &xml, &user);
+        let (xml, user) = occupant_presence(room, "me", "", "", &format!("{}<status code='110'/>", item("owner", "")));
+        registry.presence(room, &format!("{room}/me"), &xml, &user);
+        let changes = registry.take_roster_changes();
+        assert_eq!(changes.len(), 1);
+        let people = &changes[0].1;
+        let amy = people.iter().find(|p| p.nick == "amy").unwrap();
+        assert_eq!(
+            (amy.affiliation.as_str(), amy.show.as_str(), amy.jid.as_deref(), amy.own),
+            ("admin", "away", Some("amy@example.org"), false)
+        );
+        let me = people.iter().find(|p| p.nick == "me").unwrap();
+        assert!(me.own && me.jid.is_none(), "anonymous rooms show no address");
+        assert!(registry.take_roster_changes().is_empty(), "nothing changed since the last report");
+
+        // An identical presence is not a change; leaving is.
+        let (xml, user) = occupant_presence(room, "amy", "<show>away</show>", "", &item("admin", " jid='amy@example.org/phone'"));
+        registry.presence(room, &format!("{room}/amy"), &xml, &user);
+        assert!(registry.take_roster_changes().is_empty());
+        let (xml, user) = occupant_presence(room, "amy", "", " type='unavailable'", &item("admin", ""));
+        registry.presence(room, &format!("{room}/amy"), &xml, &user);
+        let changes = registry.take_roster_changes();
+        assert_eq!(changes[0].1.iter().map(|p| p.nick.as_str()).collect::<Vec<_>>(), ["me"]);
+    }
+
+    #[test]
+    fn roster_fields_only_ever_hold_known_values_however_large_the_stanza() {
+        let room = "room@conference.example.org";
+        let mut registry = Registry::default();
+        registry.reset(room);
+        registry.take_roster_changes();
+        // The restricted XML parser already refuses large attribute values; element text such as
+        // <show> is accepted up to the stanza limit, so that is where the large value arrives.
+        let huge_text = "x".repeat(200_000);
+        let long_attribute = "y".repeat(1_000);
+        let (xml, user) = occupant_presence(
+            room,
+            "mallory",
+            &format!("<show>{huge_text}</show>"),
+            "",
+            &format!("<item affiliation='{long_attribute}' role='{long_attribute}'/>"),
+        );
+        registry.presence(room, &format!("{room}/mallory"), &xml, &user);
+        let people = registry.take_roster_changes().pop().unwrap().1;
+        let mallory = &people[0];
+        assert_eq!((mallory.affiliation.as_str(), mallory.role.as_str(), mallory.show.as_str()), ("none", "participant", ""));
+        // The real values still come through unchanged.
+        for (show, affiliation, role) in [("away", "owner", "moderator"), ("dnd", "outcast", "visitor"), ("chat", "member", "none"), ("xa", "admin", "participant")] {
+            let (xml, user) = occupant_presence(room, "p", &format!("<show>{show}</show>"), "", &format!("<item affiliation='{affiliation}' role='{role}'/>"));
+            registry.presence(room, &format!("{room}/p"), &xml, &user);
+            let people = registry.take_roster_changes().pop().unwrap().1;
+            let p = people.iter().find(|p| p.nick == "p").unwrap();
+            assert_eq!((p.show.as_str(), p.affiliation.as_str(), p.role.as_str()), (show, affiliation, role));
+        }
+        // Unknown values never reach the encryption-recipient bookkeeping either.
+        assert!(registry.rooms[room].occupants.values().all(|(_, a)| AFFILIATIONS.contains(&a.as_str()) || a.is_empty()));
+    }
+
+    #[test]
+    fn leaving_a_room_reports_an_empty_roster() {
+        let room = "room@conference.example.org";
+        let mut registry = Registry::default();
+        registry.reset(room);
+        let (xml, user) = occupant_presence(room, "amy", "", "", "<item affiliation='member' role='participant'/>");
+        registry.presence(room, &format!("{room}/amy"), &xml, &user);
+        registry.take_roster_changes();
+        registry.remove(room);
+        assert_eq!(registry.take_roster_changes(), vec![(room.to_owned(), vec![])]);
+        assert!(registry.take_roster_changes().is_empty());
+    }
+
+    #[test]
+    fn public_rooms_are_rejected_from_their_features_before_member_lists_are_requested() {
+        let info = |features: &[&str]| -> Element {
+            let features: String = features
+                .iter()
+                .map(|feature| format!("<feature var='{feature}'/>"))
+                .collect();
+            format!("<query xmlns='{DISCO}'>{features}</query>").parse().unwrap()
+        };
+        assert!(matches!(
+            require_private(&info(&["muc_open", "muc_semianonymous", "muc_unmoderated"])),
+            Err(Error::NotPrivate)
+        ));
+        assert!(matches!(
+            require_private(&info(&["muc_membersonly"])),
+            Err(Error::NotPrivate)
+        ));
+        assert!(require_private(&info(&["muc_membersonly", "muc_nonanonymous"])).is_ok());
+    }
+
+    #[test]
+    fn admitted_affiliation_changes_keep_complete_recipients_but_revocation_blocks() {
+        let room = "room@conference.example.org";
+        let owner = "owner@example.org";
+        for presence_affiliation in ["member", "admin", "owner", "none", "outcast"] {
+            for listed in [Affiliation::Member, Affiliation::Admin, Affiliation::Owner] {
+                let mut rooms = Rooms::new(owner.into());
+                rooms.join(room, Some("own")).unwrap();
+                let own: Element = format!("<presence xmlns='jabber:client' from='{room}/own'><x xmlns='http://jabber.org/protocol/muc#user'><item jid='{owner}/desktop' affiliation='member' role='participant'/><status code='110'/></x></presence>").parse().unwrap();
+                rooms.presence(&own);
+                let other: Element = format!("<presence xmlns='jabber:client' from='{room}/buddy'><x xmlns='http://jabber.org/protocol/muc#user'><item jid='buddy@example.org/phone' affiliation='{presence_affiliation}' role='participant'/></x></presence>").parse().unwrap();
+                rooms.presence(&other);
+                let revision = rooms.begin_member_refresh(room).unwrap();
+                rooms.member_refresh_finished(
+                    room,
+                    revision,
+                    Ok(MemberSnapshot {
+                        room: room.into(),
+                        affiliations: [
+                            (owner.into(), Affiliation::Member),
+                            ("buddy@example.org".into(), listed),
+                        ]
+                        .into(),
+                    }),
+                );
+                assert_eq!(
+                    rooms.recipients(room).is_ok(),
+                    matches!(presence_affiliation, "member" | "admin" | "owner")
+                );
+                // A complete list still has to contain each identified occupant.
+                let revision = rooms.recipient_revision(room).unwrap();
+                assert!(
+                    rooms
+                        .install_recipients(
+                            room,
+                            revision,
+                            MemberSnapshot {
+                                room: room.into(),
+                                affiliations: [(owner.into(), Affiliation::Member)].into()
+                            }
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multisession_presence_confirms_join_and_keeps_recipient_identity() {
+        let room = "room@conference.example.org";
+        let owner = "owner@example.org";
+        let mut rooms = Rooms::new(owner.into());
+        rooms.join(room, Some("own")).unwrap();
+        let presence = |nick: &str, author: &str, own: bool| -> Element {
+            format!("<presence xmlns='jabber:client' from='{room}/{nick}' to='{owner}/desktop'><x xmlns='http://jabber.org/protocol/muc#user'><status code='100'/><item jid='{author}/phone' affiliation='member' role='participant'/><item jid='{author}/desktop' affiliation='member' role='participant'/>{}</x></presence>",if own {"<status code='110'/>"} else {""}).parse().unwrap()
+        };
+        assert!(
+            rooms
+                .presence(&presence("buddy", "buddy@example.org", false))
+                .is_none()
+        );
+        let mut jobs = manage::Pending::default();
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        jobs.insert(room.into(), rooms.join_id(room).unwrap(), reply);
+        let joined = rooms
+            .presence(&presence("own", owner, true))
+            .expect("accept consistent resource items");
+        jobs.changed(&rooms, room);
+        assert!(joined.joined && joined.can_send);
+        assert_eq!(answer.try_recv().unwrap().unwrap().nick, "own");
+        let revision = rooms
+            .begin_member_refresh(room)
+            .expect("multi-item presence must not invalidate identity");
+        rooms.member_refresh_finished(
+            room,
+            revision,
+            Ok(MemberSnapshot {
+                room: room.into(),
+                affiliations: [
+                    (owner.into(), Affiliation::Member),
+                    ("buddy@example.org".into(), Affiliation::Member),
+                ]
+                .into(),
+            }),
+        );
+        assert_eq!(rooms.recipients(room).unwrap().members.len(), 2);
+        let message: Element =
+            format!("<message xmlns='jabber:client' from='{room}/buddy' type='groupchat'/>")
+                .parse()
+                .unwrap();
+        assert_eq!(
+            rooms.sender(&message, false).unwrap().author,
+            "buddy@example.org"
+        );
+    }
+    #[test]
+    fn multisession_self_presence_rejects_conflicting_items() {
+        let room = "room@conference.example.org";
+        let owner = "owner@example.org";
+        for second in [
+            "jid='attacker@example.org/phone' affiliation='member' role='participant'",
+            "jid='owner@example.org/phone' affiliation='owner' role='participant'",
+            "jid='owner@example.org/phone' affiliation='member' role='moderator'",
+            "affiliation='member' role='participant'",
+            "jid='invalid jid' affiliation='member' role='participant'",
+            "jid='owner@example.org/phone' affiliation='member' role='participant' nick='other'",
+        ] {
+            let mut rooms = Rooms::new(owner.into());
+            rooms.join(room, Some("own")).unwrap();
+            let xml: Element = format!("<presence xmlns='jabber:client' from='{room}/own'><x xmlns='http://jabber.org/protocol/muc#user'><item jid='{owner}/desktop' affiliation='member' role='participant'/><item {second}/><status code='110'/></x></presence>").parse().unwrap();
+            assert!(
+                rooms.presence(&xml).is_none(),
+                "reject inconsistent identity/permission data"
+            );
+            assert!(!rooms.is_joined(room));
+        }
+        let xml: Element = format!(
+            "<x xmlns='http://jabber.org/protocol/muc#user'>{}</x>",
+            format!("<item jid='{owner}/resource' role='participant' affiliation='member'/>")
+                .repeat(129)
+        )
+        .parse()
+        .unwrap();
+        assert!(user_item(&xml).is_err(), "resource list must be bounded");
+    }
+
     #[test]
     fn recipient_snapshot_tracks_prejoin_occupants_and_fences_lifecycle() {
         let room = "room@conference.example.org";
@@ -308,8 +667,8 @@ mod tests {
         let changed = rooms.begin_member_refresh(room).unwrap();
         rooms.member_refresh_finished(room, changed, Ok(mismatched));
         assert!(
-            rooms.recipients(room).is_err(),
-            "occupant affiliations must agree with the lists"
+            rooms.recipients(room).is_ok(),
+            "an affiliation change between admitted roles does not remove membership"
         );
         let message: Element =
             format!("<message xmlns='jabber:client' from='{room}/buddy' type='groupchat'/>")
@@ -410,5 +769,179 @@ mod tests {
                 .parse()
                 .unwrap();
         assert!(complete("room@conference.example.org", anonymous, lists).is_err());
+    }
+
+    /// A member list that loaded fine is still unusable when someone currently in the room hides
+    /// their address; the error names that occupant instead of the generic one.
+    #[test]
+    fn an_occupant_without_a_disclosed_address_is_named_in_the_error() {
+        let room = "room@conference.example.org";
+        let owner = "owner@example.org";
+        let mut rooms = Rooms::new(owner.into());
+        rooms.join(room, Some("own")).unwrap();
+        let presence = |nick: &str, jid: Option<&str>, affiliation: &str, own: bool| {
+            let jid = jid.map(|jid| format!(" jid='{jid}'")).unwrap_or_default();
+            let status = if own { "<status code='110'/>" } else { "" };
+            format!("<presence xmlns='jabber:client' from='{room}/{nick}'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='{affiliation}' role='participant'{jid}/>{status}</x></presence>").parse::<Element>().unwrap()
+        };
+        rooms.presence(&presence("own", Some(owner), "owner", true));
+        let snapshot = MemberSnapshot {
+            room: room.into(),
+            affiliations: [(owner.into(), Affiliation::Owner), ("buddy@example.org".into(), Affiliation::Member)].into(),
+        };
+        let revision = rooms.begin_member_refresh(room).unwrap();
+        rooms.member_refresh_finished(room, revision, Ok(snapshot.clone()));
+        assert!(rooms.recipients(room).is_ok(), "the listed members alone are fine");
+
+        rooms.presence(&presence("lurker", None, "none", false));
+        let revision = rooms.begin_member_refresh(room).unwrap();
+        rooms.member_refresh_finished(room, revision, Ok(snapshot));
+        let error = rooms.recipients(room).unwrap_err();
+        assert_eq!(error, Error::OccupantNotListed("lurker".into()));
+        assert_eq!(
+            error.to_string(),
+            "lurker is in this room but is not a listed member or hides their address, so the message cannot be encrypted for them"
+        );
+    }
+
+    // ---- XEP-0317 hats ------------------------------------------------------------------
+
+    const ROOM: &str = "room@conference.example.org";
+    const HATS: &str = "<hats xmlns='urn:xmpp:hats:0'><hat title='Host' uri='urn:h' hue='120'/></hats>";
+
+    fn join(registry: &mut Registry, nick: &str, extra: &str) {
+        let (xml, user) = occupant_presence(ROOM, nick, extra, "", "<item affiliation='none' role='participant'/>");
+        registry.presence(ROOM, &format!("{ROOM}/{nick}"), &xml, &user);
+    }
+    fn roster(registry: &mut Registry) -> Vec<Participant> {
+        registry.take_roster_changes().pop().map(|(_, people)| people).unwrap_or_default()
+    }
+    fn hats_of(people: &[Participant], nick: &str) -> Vec<String> {
+        people.iter().find(|p| p.nick == nick).unwrap().hats.iter().map(|h| h.title.clone()).collect()
+    }
+
+    #[test]
+    fn hats_are_hidden_until_the_room_advertises_support() {
+        let mut registry = Registry::default();
+        registry.reset(ROOM);
+        registry.take_roster_changes();
+        join(&mut registry, "amy", HATS);
+        let people = roster(&mut registry);
+        assert!(hats_of(&people, "amy").is_empty(), "an unsupported room's hats are not shown");
+        // Nothing about the stanza itself was lost: it is just not trusted yet.
+        registry.set_hats(ROOM, true);
+        assert_eq!(hats_of(&roster(&mut registry), "amy"), ["Host"]);
+    }
+
+    #[test]
+    fn a_forged_hat_in_a_room_without_hats_never_reaches_the_screen() {
+        let mut registry = Registry::default();
+        registry.reset(ROOM);
+        registry.take_roster_changes();
+        // A plain occupant claims to be an administrator in their own presence.
+        join(&mut registry, "mallory", "<hats xmlns='urn:xmpp:hats:0'><hat title='Server Admin' uri='urn:admin' hue='0'/></hats>");
+        join(&mut registry, "bob", "");
+        let people = roster(&mut registry);
+        assert!(people.iter().all(|p| p.hats.is_empty()));
+        assert_eq!(people.len(), 2, "they are still listed");
+    }
+
+    #[test]
+    fn support_learned_before_or_after_the_roster_gives_the_same_result() {
+        for early in [true, false] {
+            let mut registry = Registry::default();
+            if early {
+                registry.set_hats(ROOM, true);
+            }
+            registry.reset(ROOM);
+            registry.take_roster_changes();
+            join(&mut registry, "amy", HATS);
+            if !early {
+                registry.set_hats(ROOM, true);
+            }
+            assert_eq!(hats_of(&roster(&mut registry), "amy"), ["Host"], "early: {early}");
+        }
+    }
+
+    #[test]
+    fn learning_of_support_reports_the_roster_again_and_only_once() {
+        let mut registry = Registry::default();
+        registry.reset(ROOM);
+        join(&mut registry, "amy", HATS);
+        registry.take_roster_changes();
+        assert!(registry.take_roster_changes().is_empty());
+        registry.set_hats(ROOM, true);
+        assert_eq!(roster(&mut registry).len(), 1, "reported so the hats appear");
+        registry.set_hats(ROOM, true);
+        assert!(registry.take_roster_changes().is_empty(), "same news is not repeated");
+        registry.set_hats(ROOM, false);
+        let people = roster(&mut registry);
+        assert!(hats_of(&people, "amy").is_empty(), "withdrawn support hides them again");
+    }
+
+    #[test]
+    fn support_survives_a_roster_reset_and_ends_when_the_room_does() {
+        let mut registry = Registry::default();
+        registry.set_hats(ROOM, true);
+        registry.reset(ROOM);
+        registry.reset(ROOM);
+        join(&mut registry, "amy", HATS);
+        assert_eq!(hats_of(&roster(&mut registry), "amy"), ["Host"]);
+        registry.remove(ROOM);
+        registry.reset(ROOM);
+        join(&mut registry, "amy", HATS);
+        assert!(hats_of(&roster(&mut registry), "amy").is_empty(), "leaving forgets the room's support");
+        registry.set_hats(ROOM, true);
+        registry.clear();
+        registry.reset(ROOM);
+        join(&mut registry, "amy", HATS);
+        assert!(hats_of(&roster(&mut registry), "amy").is_empty(), "disconnecting forgets all of it");
+        registry.set_hats("elsewhere@conference.example.org", true);
+        registry.reset(ROOM);
+        join(&mut registry, "amy", HATS);
+        assert!(hats_of(&roster(&mut registry), "amy").is_empty(), "support is per room");
+    }
+
+    #[test]
+    fn changing_hats_changes_the_roster_and_repeating_them_does_not() {
+        let mut registry = Registry::default();
+        registry.set_hats(ROOM, true);
+        registry.reset(ROOM);
+        registry.take_roster_changes();
+        join(&mut registry, "amy", HATS);
+        registry.take_roster_changes();
+        join(&mut registry, "amy", HATS);
+        assert!(registry.take_roster_changes().is_empty(), "an identical presence is not news");
+        join(&mut registry, "amy", "<hats xmlns='urn:xmpp:hats:0'><hat title='Host' uri='urn:h' hue='121'/></hats>");
+        assert_eq!(roster(&mut registry).len(), 1, "a different hue is");
+        join(&mut registry, "amy", "");
+        assert!(hats_of(&roster(&mut registry), "amy").is_empty(), "taking the hat off is");
+    }
+
+    #[test]
+    fn hostile_hats_are_cleaned_in_the_roster_and_cannot_flood_it() {
+        let mut registry = Registry::default();
+        registry.set_hats(ROOM, true);
+        registry.reset(ROOM);
+        registry.take_roster_changes();
+        let many: String = (0..100).map(|i| format!("<hat title='H{i}' uri='u{i}' hue='nan'/>")).collect();
+        join(&mut registry, "amy", &format!("<hats xmlns='urn:xmpp:hats:0'><hat title='\u{202e}Own\u{200b}er' uri='o'/>{many}</hats>"));
+        let people = roster(&mut registry);
+        let amy = people.iter().find(|p| p.nick == "amy").unwrap();
+        assert_eq!(amy.hats.len(), crate::rooms::hats::MAX_HATS);
+        assert_eq!(amy.hats[0].title, "Owner");
+        assert!(amy.hats.iter().all(|h| h.hue().is_none()));
+    }
+
+    #[test]
+    fn an_unavailable_presence_removes_the_person_with_their_hats() {
+        let mut registry = Registry::default();
+        registry.set_hats(ROOM, true);
+        registry.reset(ROOM);
+        join(&mut registry, "amy", HATS);
+        registry.take_roster_changes();
+        let (xml, user) = occupant_presence(ROOM, "amy", "", " type='unavailable'", "<item affiliation='none' role='none'/>");
+        registry.presence(ROOM, &format!("{ROOM}/amy"), &xml, &user);
+        assert!(roster(&mut registry).is_empty());
     }
 }

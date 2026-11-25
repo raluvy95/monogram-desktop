@@ -1,5 +1,5 @@
 use crate::{
-    encryption_policy::{Mode, Preference, Selection},
+    encryption_policy::{Mode, Preference},
     model::Chat,
     protocol::Command,
     ui::Ui,
@@ -8,11 +8,21 @@ use adw::prelude::*;
 use gtk::glib;
 use std::rc::Rc;
 
+/// Shown instead of sending when automatic selection could only offer plaintext for a room that has
+/// used encryption. The cause is often one member who has no usable keys, not the room itself.
+pub const DOWNGRADE_NOTICE: &str = "This room could not be fully encrypted, so nothing was sent. To send unencrypted anyway, choose Unencrypted in Conversation Security.";
+/// The toast for a room whose encryption was blocked; the reason is in Message Details.
+pub const DOWNGRADE_TOAST: &str = crate::text_safety::NOT_SENT_TOAST;
+/// Shown in Message Details when automatic selection ended at plaintext for a room that has used
+/// encryption and nothing was sent.
+pub const DOWNGRADE_REASON: &str = "This room could not be fully encrypted, so nothing was sent. Someone in it may have no usable keys, or it may no longer offer encryption. Send Anyway encrypts for everyone who has keys; choosing Unencrypted in Conversation Security sends in plain text.";
+
 impl Ui {
     pub(crate) fn update_send_button(&self) {
         self.send_button.set_sensitive(
             !self.composer_text().trim().is_empty() || !self.attachments.borrow().is_empty(),
         );
+        self.voice_refresh();
     }
 
     pub fn sending_mode(&self, chat: &Chat) -> Option<Mode> {
@@ -45,6 +55,17 @@ impl Ui {
                 .ready
                 .then(|| self.pq_crypto.borrow().fingerprint.clone()),
         }
+    }
+
+    /// The encryption check failed. A Legacy OMEMO contact-authorization denial offers Resolve.
+    pub(crate) fn report_encryption_check_failure(
+        self: &Rc<Self>,
+        _peer: &str,
+        error: &crate::crypto::Error,
+    ) {
+        let reason = error.to_string();
+        let title = format!("Could not check conversation encryption. {reason}");
+        self.notice_resolving_authorization(&reason, title);
     }
 
     pub fn choose_sending(self: &Rc<Self>, then: impl FnOnce(&Rc<Self>, Mode) + 'static) {
@@ -81,6 +102,7 @@ impl Ui {
         if !self.command(Command::ChooseEncryption {
             peer: peer.clone(),
             reply,
+            skip_unreachable: self.send_anyway_active(&peer),
         }) {
             self.notice("Encryption check could not start. Your draft is kept.");
             return;
@@ -114,7 +136,7 @@ impl Ui {
             let mode = match result {
                 Ok(Ok(mode)) => mode,
                 Ok(Err(error)) => {
-                    ui.notice(&format!("Could not check conversation encryption. {error}"));
+                    ui.report_encryption_check_failure(&peer, &error);
                     return;
                 }
                 Err(_) => {
@@ -122,16 +144,11 @@ impl Ui {
                     return;
                 }
             };
-            {
-                let mut state = ui.state.borrow_mut();
-                let chat = state.current_mut();
-                chat.sending_preference = Some(Preference::Automatic);
-                chat.automatic_encryption = Some(Selection {
-                    mode,
-                    time_ms: chrono::Utc::now().timestamp_millis(),
-                });
-                chat.encryption = mode.encrypted();
+            if ui.encryption_downgrade_blocked(&peer, mode) {
+                ui.notice(DOWNGRADE_NOTICE);
+                return;
             }
+            ui.state.borrow_mut().current_mut().remember_selection(mode);
             if !ui.persist() {
                 ui.state.borrow_mut().current_mut().automatic_encryption = None;
                 return;
@@ -141,6 +158,20 @@ impl Ui {
             }
             then(&ui, mode);
         });
+    }
+
+    /// Whether `mode` would silently downgrade a room that has used encryption (see
+    /// `Chat::downgrade_blocked`). The database is checked too, for rooms whose history predates
+    /// the flag and is no longer loaded.
+    pub fn encryption_downgrade_blocked(&self, peer: &str, mode: Mode) -> bool {
+        let state = self.state.borrow();
+        let Some(chat) = state.chats.iter().find(|chat| chat.jid == peer) else {
+            return false;
+        };
+        chat.downgrade_blocked(mode)
+            || (chat.group
+                && mode == Mode::Plain
+                && self.store.sent_encrypted(&state.account, peer).unwrap_or(true))
     }
 
     pub fn update_encryption_check(&self) {

@@ -1,13 +1,22 @@
 use adw::prelude::*;
+mod account_deletion;
+mod adhoc;
+mod adhoc_ui;
 mod action_store;
 mod attachment_ui;
+mod audio_ui;
 mod avatar;
 mod avatar_ui;
 mod blocking;
 mod blocking_ui;
 mod clipboard_upload;
+mod drop_files;
 mod chat_states;
+mod composer_view;
+mod chat_navigation;
 mod contact_access;
+mod contact_details;
+mod contact_details_ui;
 mod contact_access_ui;
 mod composer_attachments_ui;
 mod credentials;
@@ -21,6 +30,7 @@ mod downloads;
 mod emoji_completion;
 mod emoji_picker_ui;
 mod emoji_preferences;
+mod favorite_order_store;
 mod encryption_policy;
 mod file_share;
 mod folder_actions;
@@ -56,25 +66,56 @@ mod media;
 mod media_caption;
 mod media_library_ui;
 mod media_store;
+mod motion_photo;
+mod motion_photo_ui;
 mod message_actions;
 mod messages;
 mod model;
 mod packs;
+mod preview_cache;
 mod polls;
 mod polls_ui;
 mod protocol;
+mod profiles;
+mod profile_ui;
 mod pq_security_ui;
 mod read_markers;
 mod read_state;
 mod request_logic;
+#[allow(dead_code)] // Reached from the editor dialog in the next authoring step.
+mod media_author_run;
+#[allow(dead_code)] // Reached from the editor dialog in the next authoring step.
+mod media_authoring;
+mod animated_emoji_ui;
+mod audio_bubble_ui;
+mod audio_check;
+mod audio_player;
+mod audio_preview_run;
+mod client_commands_ui;
+mod confined;
+mod crop_area;
+mod noto_emoji;
+mod picture_editor;
+mod picture_editor_ui;
+mod sysinfo;
+mod message_failures;
+mod text_safety;
+mod toast_routing;
+mod room_members_ui;
 mod room_ui;
 mod rooms;
 mod send_policy_ui;
 mod selection_actions;
 mod send_queue;
 mod send_animation;
+mod message_gestures;
+mod pack_editor;
+mod pack_files;
+mod picker_zoom;
 mod smoke;
 mod spoilers;
+mod stories;
+mod stories_ui;
 mod storage;
 mod transport;
 mod ui;
@@ -83,6 +124,19 @@ mod upload_ui;
 mod uploads;
 mod video_ui;
 mod wallet;
+mod camera;
+mod camera_ui;
+mod components;
+mod contact_status;
+mod hat_color;
+mod last_activity;
+mod last_activity_ui;
+mod presence_privacy;
+mod slow_notice;
+mod voice;
+mod voice_ui;
+#[cfg(test)]
+mod runtime_guard;
 mod widgets;
 thread_local! {static SMOKE_TICK: std::cell::Cell<std::time::Instant> = std::cell::Cell::new(std::time::Instant::now()); static SMOKE_MAX_GAP: std::cell::Cell<u128> = const{std::cell::Cell::new(0)};}
 fn main() -> gtk::glib::ExitCode {
@@ -125,12 +179,19 @@ fn main() -> gtk::glib::ExitCode {
                     "--smoke-test" | "--live-smoke-test" | "--crypto-smoke-test"
                 )
             }) {
-                gtk::gio::ApplicationFlags::NON_UNIQUE
+                gtk::gio::ApplicationFlags::NON_UNIQUE | gtk::gio::ApplicationFlags::HANDLES_OPEN
             } else {
-                gtk::gio::ApplicationFlags::empty()
+                gtk::gio::ApplicationFlags::HANDLES_OPEN
             },
         )
         .build();
+    app.connect_open(|app,files,_| {
+        app.activate();
+        OPEN_FILES.with(|pending| pending.borrow_mut().extend(files.iter().take(16).cloned()));
+        ROOT.with(|root| {if let Some(ui)=root.borrow().as_ref(){
+            for file in OPEN_FILES.with(|pending|pending.take()){ui.open_pack_file(file);}
+        }});
+    });
     app.connect_activate(move |app| {
         crate::widgets::install_icons();
         if let Some(window) = app.active_window() {
@@ -167,6 +228,26 @@ fn main() -> gtk::glib::ExitCode {
                 started.elapsed().as_millis()
             );
             let ui = ui::Ui::new_with_window(&app, smoke, ready_window);
+            #[cfg(debug_assertions)]
+            {
+                let probe = gtk::gio::SimpleAction::new("diagnose-encryption", None);
+                let weak = std::rc::Rc::downgrade(&ui);
+                probe.connect_activate(move |_, _| {
+                    let Some(ui) = weak.upgrade() else { return };
+                    let peer = ui.state.borrow().current().jid.clone();
+                    let (reply, receive) = tokio::sync::oneshot::channel();
+                    if ui.command(protocol::Command::ChooseEncryption { peer, reply, skip_unreachable: false }) {
+                        gtk::glib::MainContext::default().spawn_local(async move {
+                            match receive.await {
+                                Ok(Ok(mode)) => eprintln!("Monogram diagnostic encryption choice: {mode:?}"),
+                                Ok(Err(error)) => eprintln!("Monogram diagnostic encryption choice: {}", error.diagnostic()),
+                                Err(_) => eprintln!("Monogram diagnostic encryption choice interrupted"),
+                            }
+                        });
+                    }
+                });
+                app.add_action(&probe);
+            }
             let reconnect = ui.clone();
             after_next_paint(&ui.window, move || {
                 eprintln!(
@@ -251,7 +332,9 @@ fn main() -> gtk::glib::ExitCode {
                     capture.activate(None);
                 });
             }
-            ROOT.with(|root| root.replace(Some(ui)));
+            ROOT.with(|root| root.replace(Some(ui.clone())));
+            for file in OPEN_FILES.with(|pending|pending.take()){ui.open_pack_file(file);}
+
         });
         present_window(&window, monitor.as_deref(), started);
     });
@@ -273,8 +356,7 @@ fn main() -> gtk::glib::ExitCode {
 }
 
 fn startup_page() -> adw::ToolbarView {
-    let view = adw::ToolbarView::new();
-    view.add_top_bar(&adw::HeaderBar::new());
+    let view = components::titled_page();
     let spinner = gtk::Spinner::builder().spinning(true).build();
     let page = adw::StatusPage::builder()
         .icon_name("mail-unread-symbolic")
@@ -433,3 +515,17 @@ fn present_window(
     window.present();
 }
 thread_local! {static ROOT:std::cell::RefCell<Option<std::rc::Rc<ui::Ui>>>=const{std::cell::RefCell::new(None)};}
+
+#[cfg(test)]
+#[path = "../tests/picker_actions_native.rs"]
+mod picker_actions_native;
+
+#[cfg(test)]
+#[path = "../tests/room_restore_native.rs"]
+mod room_restore_native;
+
+thread_local! {static OPEN_FILES:std::cell::RefCell<Vec<gtk::gio::File>>=const{std::cell::RefCell::new(Vec::new())};}
+
+#[cfg(test)]
+#[path="../tests/profile_invite_audio_native.rs"]
+mod profile_invite_audio_native;

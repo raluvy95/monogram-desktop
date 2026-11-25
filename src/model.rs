@@ -58,6 +58,12 @@ pub struct Message {
     pub timestamp: String,
     pub delivery: String,
     pub outbox_pending: bool,
+    /// The sender chose to send this room message without members whose keys cannot be used.
+    pub skip_unreachable: bool,
+    /// Room members this message was sent without, each with why. Set after a partial send.
+    pub skipped_members: Vec<(String, String)>,
+    /// Why the last send failed, shown in Message Details; empty unless it failed.
+    pub failure_reason: String,
     pub wire_id: String,
     pub aliases: Vec<String>,
     pub options: Vec<(String, u32)>,
@@ -107,6 +113,9 @@ impl Default for Message {
             timestamp: now(),
             delivery: "local".into(),
             outbox_pending: false,
+            skip_unreachable: false,
+            skipped_members: Vec::new(),
+            failure_reason: String::new(),
             wire_id: String::new(),
             aliases: vec![],
             options: vec![],
@@ -118,7 +127,8 @@ impl Default for Message {
 impl Message {
     pub fn reply_preview(&self) -> String {
         let preview = self.preview();
-        let Some((end, _)) = preview.char_indices().nth(80) else {
+        // Leave visible truncation to the width-aware two-line widget.
+        let Some((end, _)) = preview.char_indices().nth(4096) else {
             return preview;
         };
         let prefix = &preview[..end];
@@ -133,7 +143,7 @@ impl Message {
         let word_end = preview[end..]
             .find(char::is_whitespace)
             .map_or(preview.len(), |index| end + index);
-        let long_word = preview[word_start..word_end].chars().count() > 80;
+        let long_word = preview[word_start..word_end].chars().count() > 4096;
         let keep = if at_boundary || long_word {
             prefix
         } else {
@@ -220,14 +230,14 @@ impl Message {
     pub fn preview(&self) -> String {
         if let Some(upload) = &self.upload {
             return if self.text.is_empty() {
-                format!("📎 {}", upload.name)
+                if upload.sticker { "Sticker".into() } else if upload.voice { "Voice message".into() } else { format!("📎 {}", upload.name) }
             } else {
                 crate::formatting::preview(self)
             };
         }
         if let Some(file) = &self.attachment {
             return if self.text.is_empty() {
-                format!("📎 {}", file.name)
+                if file.sticker { "Sticker".into() } else if file.voice { "Voice message".into() } else { format!("📎 {}", file.name) }
             } else {
                 crate::formatting::preview(self)
             };
@@ -281,10 +291,16 @@ impl Message {
 #[serde(default)]
 pub struct Chat {
     pub encryption: bool,
+    /// Sticky: set the first time encryption is used here and never cleared by an automatic
+    /// choice. A room that has been encrypted must not silently fall back to plaintext because a
+    /// server says it no longer offers encryption.
+    pub encrypted_history: bool,
     pub sending_preference: Option<Preference>,
     pub automatic_encryption: Option<Selection>,
     pub id: String,
     pub name: String,
+    #[serde(skip)]
+    pub local_name: String,
     pub subtitle: String,
     pub avatar: String,
     pub color: String,
@@ -314,6 +330,7 @@ pub struct Chat {
     pub draft_formatting: Option<crate::formatting::Markup>,
 }
 impl Chat {
+    pub fn display_name(&self) -> &str { if self.local_name.is_empty() { &self.name } else { &self.local_name } }
     pub fn encryption_preference(&self) -> Preference {
         self.sending_preference.unwrap_or(if self.encryption {
             Preference::Omemo2
@@ -325,7 +342,32 @@ impl Chat {
         self.encryption_preference().forced().or_else(|| {
             self.automatic_encryption
                 .and_then(|selection| selection.current(Utc::now().timestamp_millis()))
+                // A cached "plain" must not outlive the server's say-so for a room that has used
+                // encryption: probe again instead of trusting it.
+                .filter(|mode| !(self.group && *mode == Mode::Plain && self.had_encryption()))
         })
+    }
+    /// Whether encryption was ever used in this chat: the sticky flag, the current setting, or an
+    /// own encrypted message that is loaded.
+    pub fn had_encryption(&self) -> bool {
+        self.encrypted_history
+            || self.encryption
+            || self.messages.iter().any(|m| m.own && m.mode().encrypted())
+    }
+    /// Whether the automatic choice `mode` would be a downgrade to plaintext in a room that has
+    /// used encryption. Such a send is refused; the user must choose Unencrypted explicitly.
+    pub fn downgrade_blocked(&self, mode: Mode) -> bool {
+        self.group && mode == Mode::Plain && self.had_encryption()
+    }
+    /// Record an automatic choice. Only call this for a choice that is allowed.
+    pub fn remember_selection(&mut self, mode: Mode) {
+        self.encrypted_history |= self.had_encryption() || mode.encrypted();
+        self.sending_preference = Some(Preference::Automatic);
+        self.automatic_encryption = Some(Selection {
+            mode,
+            time_ms: Utc::now().timestamp_millis(),
+        });
+        self.encryption = mode.encrypted();
     }
     pub fn latest_key(&self) -> Option<(&str, &str)> {
         let loaded = self
@@ -399,6 +441,11 @@ impl Folder {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Story {
+    pub id: String,
+    pub jid: String,
+    pub url: String,
+    pub mime: String,
+    pub published: i64,
     pub owner: String,
     pub asset: String,
     pub caption: String,
@@ -677,6 +724,93 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod encryption_downgrade_tests {
+    use super::*;
+
+    fn room() -> Chat {
+        Chat { group: true, jid: "room@conference.example.org".into(), ..Default::default() }
+    }
+    fn own_message(mode: Mode) -> Message {
+        let mut message = Message { own: true, ..Default::default() };
+        message.set_encryption(mode, "fingerprint".into());
+        message
+    }
+
+    #[test]
+    fn a_room_that_never_used_encryption_may_be_plain_but_every_other_room_may_not_drop_to_it() {
+        assert!(!room().downgrade_blocked(Mode::Plain), "a public room is plain by nature");
+        let mut sticky = room();
+        sticky.encrypted_history = true;
+        let mut current = room();
+        current.encryption = true;
+        let mut sent = room();
+        sent.messages.push(own_message(Mode::Pq));
+        for (name, chat) in [("sticky flag", sticky), ("current setting", current), ("an own encrypted message", sent)] {
+            assert!(chat.downgrade_blocked(Mode::Plain), "{name}");
+            assert!(!chat.downgrade_blocked(Mode::Pq), "{name}: choosing encryption is never blocked");
+            assert!(!chat.downgrade_blocked(Mode::Legacy), "{name}");
+        }
+        // Someone else's encrypted message says nothing about what this user expects.
+        let mut other = room();
+        other.messages.push(Message { own: false, encrypted: true, ..Default::default() });
+        assert!(!other.downgrade_blocked(Mode::Plain));
+    }
+
+    #[test]
+    fn one_to_one_chats_keep_their_opportunistic_behaviour() {
+        let mut chat = Chat { group: false, encryption: true, encrypted_history: true, ..Default::default() };
+        assert!(!chat.downgrade_blocked(Mode::Plain), "this change is about rooms");
+        chat.automatic_encryption = Some(Selection { mode: Mode::Plain, time_ms: Utc::now().timestamp_millis() });
+        chat.sending_preference = Some(Preference::Automatic);
+        assert_eq!(chat.selected_encryption(), Some(Mode::Plain));
+    }
+
+    #[test]
+    fn the_history_flag_is_sticky_so_a_plain_send_cannot_erase_it() {
+        let mut chat = room();
+        chat.remember_selection(Mode::Pq);
+        assert!(chat.encrypted_history && chat.encryption);
+        // Even if the encryption setting is later cleared, the history stays.
+        chat.encryption = false;
+        assert!(chat.downgrade_blocked(Mode::Plain));
+        // Legacy data has no flag but an encryption setting: the first choice records it.
+        let mut legacy = room();
+        legacy.encryption = true;
+        legacy.remember_selection(Mode::Plain);
+        assert!(legacy.encrypted_history, "recorded before the setting was overwritten");
+        assert!(legacy.downgrade_blocked(Mode::Plain));
+    }
+
+    #[test]
+    fn a_cached_plain_choice_is_not_trusted_for_a_room_that_used_encryption() {
+        let cached_plain = |chat: &mut Chat| {
+            chat.sending_preference = Some(Preference::Automatic);
+            chat.automatic_encryption = Some(Selection { mode: Mode::Plain, time_ms: Utc::now().timestamp_millis() });
+        };
+        let mut never = room();
+        cached_plain(&mut never);
+        assert_eq!(never.selected_encryption(), Some(Mode::Plain), "a never-encrypted room keeps its choice");
+        let mut had = room();
+        had.encrypted_history = true;
+        cached_plain(&mut had);
+        assert_eq!(had.selected_encryption(), None, "re-check instead of trusting the cached downgrade");
+        // An explicit user choice of Unencrypted still works: that is the override.
+        had.sending_preference = Some(Preference::Plain);
+        assert_eq!(had.selected_encryption(), Some(Mode::Plain));
+    }
+
+    #[test]
+    fn the_flag_survives_saving_and_loading_and_old_data_defaults_to_false() {
+        let mut chat = room();
+        chat.remember_selection(Mode::Legacy);
+        let restored: Chat = serde_json::from_str(&serde_json::to_string(&chat).unwrap()).unwrap();
+        assert!(restored.encrypted_history);
+        let old: Chat = serde_json::from_str(r#"{"jid":"a@b","group":true}"#).unwrap();
+        assert!(!old.encrypted_history && !old.had_encryption());
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct UploadDraft {
     pub uri: String,
@@ -684,6 +818,10 @@ pub struct UploadDraft {
     pub error: Option<String>,
     #[serde(default)]
     pub sticker: bool,
+    #[serde(default)]
+    pub voice: bool,
+    #[serde(default)]
+    pub local_sticker: Option<i64>,
 }
 impl std::fmt::Debug for UploadDraft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -703,7 +841,9 @@ mod reply_preview_tests {
             ..Default::default()
         };
         assert_eq!(short.reply_preview(), "already complete");
-        let source = (0..30)
+        let medium = Message { text: "An ordinary quoted message with more than eighty characters should fill the available two lines instead of being shortened before layout.".into(), ..Default::default() };
+        assert_eq!(medium.reply_preview(), medium.text);
+        let source = (0..1200)
             .map(|i| format!("word{i}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -717,11 +857,11 @@ mod reply_preview_tests {
         assert!(source.starts_with(kept));
         assert!(source[kept.len()..].starts_with(' '));
         let long = Message {
-            text: "é".repeat(120),
+            text: "é".repeat(5000),
             ..Default::default()
         };
         let preview = long.reply_preview();
-        assert_eq!(preview.chars().count(), 81);
+        assert_eq!(preview.chars().count(), 4097);
         assert!(preview.ends_with('…'));
     }
 }

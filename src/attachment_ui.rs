@@ -4,16 +4,28 @@ use gtk::{gio, glib};
 use std::{
     cell::Cell,
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+pub(crate) fn automatic_media_allowed(smoke: bool, own: bool, encrypted: bool, chat: &crate::model::Chat) -> bool {
+    !smoke && (own || encrypted || chat.contact || chat.group && chat.room_joined)
+}
 impl Ui {
     pub fn attachment_content(self: &Rc<Self>, message: &Message) -> gtk::Box {
         let file = message.attachment.as_ref().unwrap().clone();
+        // The sandboxed, strictly checked player takes the formats it supports; the rest fall back
+        // to the media player, as before.
+        if file.audio_candidate() {
+            return self.audio_attachment(message);
+        }
+        if file.player_audio_candidate() {
+            return self.player_audio_attachment(message);
+        }
         if file.media_candidate() {
             return self.media_attachment(message);
         }
         let owner = self.state.borrow().account.clone();
         let id = message.id.clone();
+        let pack = crate::pack_files::is_pack(&file.name, &file.mime);
         let media = file.media_candidate();
         let content = bx(true, 4);
         let controls = bx(true, 4);
@@ -63,6 +75,8 @@ impl Ui {
         let weak = Rc::downgrade(self);
         let source = file.clone();
         let account = owner.clone();
+        let open_requested=Rc::new(Cell::new(false));
+        let pending_open=open_requested.clone();
         action.connect_clicked(move |_| {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -73,24 +87,31 @@ impl Ui {
             match ui.downloads.borrow().status(&account, &source) {
                 Some(Status::Running { .. }) => {}
                 Some(Status::Ready(path)) if path.is_file() => {
-                    if !media {
+                    if pack {
+                        ui.open_pack_file(gio::File::for_path(&path));
+                    } else if !media {
                         ui.save_attachment(&id, &path);
                     }
                     return;
                 }
                 _ => {}
             }
+            if !pack && !matches!(ui.downloads.borrow().status(&account, &source), Some(Status::Running { .. })) {
+                ui.save_attachment_picker(&id, None);
+                return;
+            }
             let running = matches!(
                 ui.downloads.borrow().status(&account, &source),
                 Some(Status::Running { .. })
             );
             if running {
+                pending_open.set(false);
                 ui.downloads.borrow_mut().cancel(&account, &source);
             } else {
                 let result = ui.downloads.borrow_mut().start(&account, source.clone());
                 if let Err(reason) = result {
                     ui.notice(reason);
-                }
+                } else if pack {pending_open.set(true);}
             }
         });
         let weak = Rc::downgrade(self);
@@ -98,8 +119,6 @@ impl Ui {
         let p = progress.downgrade();
         let l = info.downgrade();
         let visible = controls.downgrade();
-        let allow_auto = !self.smoke
-            && (message.own || message.encrypted || self.state.borrow().current().contact);
         glib::timeout_add_local(Duration::from_millis(150), move || {
             let (Some(ui), Some(action), Some(progress), Some(info)) =
                 (weak.upgrade(), a.upgrade(), p.upgrade(), l.upgrade())
@@ -109,20 +128,18 @@ impl Ui {
             if ui.state.borrow().account != owner {
                 return glib::ControlFlow::Break;
             }
-            let Some(controls) = visible.upgrade().filter(|controls| controls.is_visible()) else {
+            let Some(_controls) = visible.upgrade().filter(|controls| controls.is_visible()) else {
                 return glib::ControlFlow::Break;
             };
             let status = ui.downloads.borrow().status(&owner, &file);
-            if status.is_none()
-                && allow_auto
-                && media
-                && !file.manual
-                && ui.in_chat_viewport(&controls)
-            {
-                ui.downloads
-                    .borrow_mut()
-                    .start_automatic(&owner, file.clone());
+            if open_requested.get() {
+                match &status {
+                    Some(Status::Ready(path))=>{open_requested.set(false);ui.open_pack_file(gio::File::for_path(path));}
+                    Some(Status::Failed(_) | Status::Cancelled)=>open_requested.set(false),
+                    _=>{}
+                }
             }
+
             action.set_visible(!media || !matches!(status, Some(Status::Ready(_))));
             progress.set_visible(matches!(status, Some(Status::Running { .. })));
             let (title, subtitle) = match status {
@@ -153,6 +170,7 @@ impl Ui {
                     )
                 }
                 Some(Status::Ready(_)) if media => ("", "Preparing preview…".into()),
+                Some(Status::Ready(_)) if pack => ("Open Pack", "Downloaded".into()),
                 Some(Status::Ready(_)) => ("Save As…", "Downloaded".into()),
                 Some(Status::Deferred { reason, total }) => (
                     "Download",
@@ -205,33 +223,9 @@ impl Ui {
         button.add_css_class("circular");
         button.add_css_class("media-download-action");
         button.set_tooltip_text(Some("Cancel download"));
-        let disk = gtk::DrawingArea::builder()
-            .content_width(58)
-            .content_height(58)
-            .build();
         let fraction = Rc::new(Cell::new(None::<f64>));
         let displayed_fraction = Rc::new(Cell::<f64>::new(0.));
-        let draw_fraction = fraction.clone();
-        let draw_displayed_fraction = displayed_fraction.clone();
-        let started = Instant::now();
-        disk.set_draw_func(move |_, ctx, width, height| {
-            let x = f64::from(width) / 2.;
-            let y = f64::from(height) / 2.;
-            let radius = x.min(y) - 3.;
-            ctx.set_line_width(3.);
-            ctx.set_source_rgba(1., 1., 1., 0.22);
-            ctx.arc(x, y, radius, 0., std::f64::consts::TAU);
-            let _ = ctx.stroke();
-            let start = -std::f64::consts::FRAC_PI_2;
-            let (angle, amount) = draw_fraction.get().map_or_else(
-                || (start + started.elapsed().as_secs_f64() * 3., 0.23),
-                |_| (start, draw_displayed_fraction.get().clamp(0., 1.)),
-            );
-            ctx.set_source_rgba(1., 1., 1., 0.95);
-            ctx.set_line_cap(gtk::cairo::LineCap::Round);
-            ctx.arc(x, y, radius, angle, angle + amount * std::f64::consts::TAU);
-            let _ = ctx.stroke();
-        });
+        let disk = transfer_progress_ring(fraction.clone(), displayed_fraction.clone());
         let action = gtk::Overlay::builder().child(&disk).build();
         button.set_halign(gtk::Align::Center);
         button.set_valign(gtk::Align::Center);
@@ -269,9 +263,7 @@ impl Ui {
         {
             placeholder.set_ratio(image.intrinsic_aspect_ratio());
         }
-        let allow_auto = !self.smoke
-            && !file.manual
-            && (message.own || message.encrypted || self.state.borrow().current().contact);
+        let auto_flags = (message.own, message.encrypted);
         let cancelled = Rc::new(Cell::new(false));
         let cancelled_action = cancelled.clone();
         let weak = Rc::downgrade(self);
@@ -301,6 +293,7 @@ impl Ui {
                 }
                 return;
             }
+            let allow_auto = ui.auto_download_enabled.get() && !source.manual && automatic_media_allowed(ui.smoke, auto_flags.0, auto_flags.1, ui.state.borrow().current());
             let state = ui.downloads.borrow().status(&account, &source);
             if matches!(state, Some(Status::Running { .. } | Status::Ready(_)))
                 || state.is_none() && allow_auto && !cancelled_action.get()
@@ -349,10 +342,11 @@ impl Ui {
             } else {
                 ui.downloads.borrow().status(&owner, &file)
             };
+            let allow_auto = ui.auto_download_enabled.get() && !file.manual && automatic_media_allowed(ui.smoke, auto_flags.0, auto_flags.1, ui.state.borrow().current());
             if state.is_none() && allow_auto {
                 ui.downloads
                     .borrow_mut()
-                    .start_automatic(&owner, file.clone());
+                    .start_automatic(&owner, file.clone(), if ui.auto_download_enabled.get(){ui.auto_download_limit.get()}else{0});
                 state = ui.downloads.borrow().status(&owner, &file);
             }
             let preview_error = controls.has_css_class("media-preview-error");
@@ -452,6 +446,9 @@ impl Ui {
         content
     }
     pub(crate) fn save_attachment(self: &Rc<Self>, id: &str, path: &std::path::Path) {
+        self.save_attachment_picker(id, Some(path.to_path_buf()));
+    }
+    fn save_attachment_picker(self: &Rc<Self>, id: &str, path: Option<std::path::PathBuf>) {
         let owner = self.state.borrow().account.clone();
         let peer = self.state.borrow().current().jid.clone();
         let Some(file) = self
@@ -468,15 +465,67 @@ impl Ui {
             .build();
         let owner = self.state.borrow().account.clone();
         let id = id.to_string();
-        let Some(cancel) = self.downloads.borrow().token(&owner, &file) else {
-            return;
-        };
         let key = file.key();
         let generation = self.generation.get();
-        let path = path.to_path_buf();
         let weak = Rc::downgrade(self);
         let window = self.window.clone();
         glib::MainContext::default().spawn_local(async move {
+            let destination = match chooser.save_future(Some(&window)).await {
+                Ok(file) => file,
+                Err(error) => {
+                    if !error.matches(gtk::DialogError::Dismissed) {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.notice("File selection unavailable");
+                        }
+                    }
+                    return;
+                }
+            };
+            let current =
+                |ui: &Ui| ui.generation.get() == generation && ui.state.borrow().account == owner;
+            let Some(ui) = weak.upgrade().filter(|ui| current(ui)) else {
+                return;
+            };
+            if ui
+                .store
+                .message(&owner, &peer, &id)
+                .filter(|m| !m.retracted)
+                .and_then(|m| m.attachment)
+                .is_none_or(|f| f.key() != key)
+            {
+                return;
+            }
+            if path.is_none() {
+                if let Err(reason) = ui.downloads.borrow_mut().start(&owner, file.clone()) {
+                    ui.notice(reason);
+                    return;
+                }
+            }
+            drop(ui);
+            let path = if let Some(path) = path {
+                path
+            } else {
+                loop {
+                    let Some(ui) = weak.upgrade().filter(|ui| current(ui)) else {
+                        return;
+                    };
+                    let status = ui.downloads.borrow().status(&owner, &file);
+                    match status {
+                        Some(Status::Ready(path)) => break path,
+                        Some(Status::Running { .. }) => {}
+                        _ => return,
+                    }
+                    drop(ui);
+                    glib::timeout_future(Duration::from_millis(80)).await;
+                }
+            };
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(cancel) = ui.downloads.borrow().token(&owner, &file) else {
+                return;
+            };
+            drop(ui);
             let source = path.clone();
             let expected = file.clone();
             let valid = gio::spawn_blocking(move || {
@@ -498,23 +547,11 @@ impl Ui {
                 }
             };
             drop(ui);
-            let destination = match chooser.save_future(Some(&window)).await {
-                Ok(file) => file,
-                Err(error) => {
-                    if !error.matches(gtk::DialogError::Dismissed) {
-                        if let Some(ui) = weak.upgrade() {
-                            ui.notice("File selection unavailable");
-                        }
-                    }
-                    return;
-                }
-            };
             let Some(ui) = weak.upgrade() else {
                 return;
             };
             if ui.state.borrow().account != owner
                 || ui.generation.get() != generation
-                || ui.state.borrow().current().jid != peer
                 || ui
                     .store
                     .message(&owner, &peer, &id)
@@ -558,5 +595,27 @@ impl Ui {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod automatic_media_tests {
+    use super::*;
+    #[test]
+    fn joined_room_media_follows_membership_without_rebuilding_rows() {
+        let mut chat=crate::model::Chat { group:true, ..Default::default() };
+        assert!(!automatic_media_allowed(false,false,false,&chat));
+        chat.room_joined=true;
+        assert!(automatic_media_allowed(false,false,false,&chat));
+        assert!(!automatic_media_allowed(true,false,false,&chat));
+        chat.room_joined=false;
+        assert!(!automatic_media_allowed(false,false,false,&chat));
+        chat.group=false;
+        assert!(!automatic_media_allowed(false,false,false,&chat));
+        chat.contact=true;
+        assert!(automatic_media_allowed(false,false,false,&chat));
+        chat.contact=false;
+        assert!(automatic_media_allowed(false,true,false,&chat));
+        assert!(automatic_media_allowed(false,false,true,&chat));
     }
 }
