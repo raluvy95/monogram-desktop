@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/raluvy95/monogram-desktop/compare/v0.4.0...v0.4.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **ci:** use host GPU drivers so the AppImage does not bundle LLVM-linked Mesa ([472b41d](https://github.com/raluvy95/monogram-desktop/commit/472b41d9a1b9111d8605da0dacfcad6c61470157))
+
 ## [0.4.0](https://github.com/raluvy95/monogram-desktop/compare/v0.3.0...v0.4.0) (2026-11-14)
 
 
